@@ -21,6 +21,7 @@ pub(crate) struct MessageSecretsWithTimestamp {
     /// `None` if no timestamp is available
     /// NOTE: SystemTime is not guaranteed to be monotonic.
     #[serde(default)]
+    #[cfg_attr(target_arch = "wasm32", serde(skip))]
     added_at: Option<SystemTime>,
     /// The message secrets
     #[serde(flatten)]
