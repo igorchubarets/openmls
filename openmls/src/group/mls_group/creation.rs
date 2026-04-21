@@ -420,6 +420,7 @@ impl ProcessedWelcome {
         let message_secrets_store = MessageSecretsStore::new_with_secret(
             &PastEpochDeletionPolicy::MaxEpochs(0),
             message_secrets,
+            public_group.group_context().epoch(),
         );
 
         // Extract and store the resumption PSK for the current epoch.

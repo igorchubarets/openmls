@@ -31,6 +31,9 @@ pub enum MessageDecryptionError {
     /// See [`SecretTreeError`] for more details.
     #[error(transparent)]
     SecretTreeError(#[from] SecretTreeError),
+    /// The requested epoch is not present in the secrets store snapshot.
+    #[error("The requested epoch is not present in the secrets store snapshot.")]
+    EpochNotInStore,
 }
 
 /// Message encryption error

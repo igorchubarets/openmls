@@ -460,7 +460,7 @@ impl MlsGroup {
                 // Replace the previous message secrets with the new ones and return the previous message secrets
                 let old_message_secrets = self
                     .message_secrets_store
-                    .replace_current_message_secrets(state.message_secrets);
+                    .replace_current_message_secrets(state.message_secrets, GroupEpoch(past_epoch.as_u64() + 1));
                 self.message_secrets_store.add_past_epoch_tree(
                     past_epoch,
                     old_message_secrets,

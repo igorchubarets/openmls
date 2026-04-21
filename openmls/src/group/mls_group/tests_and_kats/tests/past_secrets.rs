@@ -24,7 +24,7 @@ use openmls_traits::signatures::Signer;
 
 use crate::{
     binary_tree::LeafNodeIndex,
-    group::past_secrets::MessageSecretsStore,
+    group::{past_secrets::MessageSecretsStore, GroupEpoch},
     prelude::{tests_and_kats::utils::generate_credential_with_key, *},
     schedule::message_secrets::MessageSecrets,
 };
@@ -388,6 +388,7 @@ fn setup_tree_store_with_timestamps<Provider: OpenMlsProvider>(
     let mut message_secrets_store = MessageSecretsStore::new_with_secret(
         &PastEpochDeletionPolicy::KeepAll,
         MessageSecrets::random(ciphersuite, provider.rand(), LeafNodeIndex::new(0)),
+        GroupEpoch(0),
     );
 
     // Populate with past epoch trees
@@ -711,6 +712,7 @@ fn test_secret_tree_store() {
     let mut message_secrets_store = MessageSecretsStore::new_with_secret(
         &PastEpochDeletionPolicy::MaxEpochs(3),
         MessageSecrets::random(ciphersuite, provider.rand(), LeafNodeIndex::new(0)),
+        GroupEpoch(0),
     );
 
     // Add message secrets to the store
@@ -753,6 +755,7 @@ fn test_empty_secret_tree_store() {
     let mut message_secrets_store = MessageSecretsStore::new_with_secret(
         &PastEpochDeletionPolicy::MaxEpochs(0),
         MessageSecrets::random(ciphersuite, provider.rand(), LeafNodeIndex::new(0)),
+        GroupEpoch(0),
     );
 
     // Add message secrets to the store

@@ -485,6 +485,18 @@ pub enum ExportSecretError {
     GroupStateError(#[from] MlsGroupStateError),
 }
 
+/// Error returned by [`MlsGroup::export_message_secrets_store`].
+#[derive(Error, Debug)]
+pub enum ExportSecretsStoreError {
+    /// Serialization (postcard) failed.
+    #[error("Serialization failed: {0}")]
+    Serialize(postcard::Error),
+    /// AEAD encryption failed.
+    #[error("AEAD encryption failed")]
+    Crypto,
+}
+
+
 /// Propose PSK error
 #[derive(Error, Debug, PartialEq, Clone)]
 pub enum ProposePskError {

@@ -80,6 +80,9 @@ pub(crate) struct MessageSecretsStore {
     past_epoch_trees: VecDeque<EpochTree>,
     // The message secrets of the current epoch.
     message_secrets: MessageSecretsWithTimestamp,
+    // The epoch number corresponding to `message_secrets`.
+    #[serde(default)]
+    current_epoch: u64,
 }
 
 #[cfg(not(feature = "crypto-debug"))]
@@ -111,6 +114,7 @@ impl MessageSecretsStore {
     pub(crate) fn new_with_secret(
         policy: &PastEpochDeletionPolicy,
         message_secrets: MessageSecrets,
+        epoch: impl Into<GroupEpoch>,
     ) -> Self {
         // max or the limit of the storage size
         let max_epochs = max_epochs(policy);
@@ -122,6 +126,7 @@ impl MessageSecretsStore {
                 added_at: Some(SystemTime::now()),
                 message_secrets,
             },
+            current_epoch: epoch.into().as_u64(),
         }
     }
 
@@ -145,14 +150,21 @@ impl MessageSecretsStore {
     pub(crate) fn replace_current_message_secrets(
         &mut self,
         message_secrets: MessageSecrets,
+        new_epoch: impl Into<GroupEpoch>,
     ) -> MessageSecretsWithTimestamp {
         let mut message_secrets = MessageSecretsWithTimestamp {
             added_at: Some(SystemTime::now()),
             message_secrets,
         };
         std::mem::swap(&mut self.message_secrets, &mut message_secrets);
+        self.current_epoch = new_epoch.into().as_u64();
 
         message_secrets
+    }
+
+    /// Returns the epoch number of the current (most recent) message secrets.
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.current_epoch
     }
 
     /// Add a secret tree for a given epoch `group_epoch`.

@@ -700,3 +700,101 @@ impl MlsGroup {
         }
     }
 }
+
+/// Decrypt an application message using a stored [`MessageSecretsStore`] without
+/// requiring the full group state.
+///
+/// # Arguments
+/// * `encrypted_secrets` — Encrypted blob produced by
+///   [`MlsGroup::export_message_secrets_store`]: `nonce (12 bytes) || AEAD(group_key, postcard(MessageSecretsStore))`.
+/// * `group_key` — The same symmetric key used during
+///   [`MlsGroup::export_message_secrets_store`].  Must match the AEAD key
+///   length for the group's ciphersuite (16 or 32 bytes).
+/// * `ciphertext_tls` — TLS-encoded [`MlsMessageIn`] containing a [`PrivateMessage`].
+/// * `ciphersuite` — The group's ciphersuite.
+/// * `crypto` — An [`OpenMlsCrypto`] provider.
+///
+/// # Returns
+/// The raw application plaintext bytes on success.
+///
+/// # Errors
+/// Returns a [`MessageDecryptionError`] if the blob cannot be decrypted /
+/// decoded, or if the epoch is not present in the snapshot.
+pub fn decrypt_application_message_with_stored_secrets(
+    encrypted_secrets: &[u8],
+    group_key: &[u8],
+    ciphertext_tls: &[u8],
+    ciphersuite: openmls_traits::types::Ciphersuite,
+    crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+    use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
+    use crate::group::mls_group::past_secrets::MessageSecretsStore;
+    use tls_codec::Deserialize as _;
+
+    // Decode the MLS ciphertext first (we need the epoch for nonce reconstruction).
+    let mls_msg = MlsMessageIn::tls_deserialize(&mut &ciphertext_tls[..])
+        .map_err(|_| MessageDecryptionError::MalformedContent)?;
+    let ciphertext = match mls_msg.extract() {
+        MlsMessageBodyIn::PrivateMessage(ct) => ct,
+        _ => return Err(MessageDecryptionError::MalformedContent),
+    };
+
+    // Decrypt the MessageSecretsStore blob.
+    // Format: nonce (12 bytes) || AEAD ciphertext+tag
+    if encrypted_secrets.len() < 12 {
+        return Err(MessageDecryptionError::MalformedContent);
+    }
+    let (nonce_bytes, ct_tag) = encrypted_secrets.split_at(12);
+    let aead_type = ciphersuite.aead_algorithm();
+    let plaintext = crypto
+        .aead_decrypt(aead_type, group_key, ct_tag, nonce_bytes, &[])
+        .map_err(|_| MessageDecryptionError::MalformedContent)?;
+
+    // Deserialize the captured MessageSecretsStore.
+    let mut secrets_store: MessageSecretsStore =
+        postcard::from_bytes(&plaintext).map_err(|_| MessageDecryptionError::MalformedContent)?;
+
+    // Find the right MessageSecrets: check past_epoch_trees first, then check
+    // if the epoch matches the current (most-recent) snapshot epoch.
+    // Return EpochNotInStore if neither matches — the caller must provide the
+    // correct snapshot for the target epoch.
+    let epoch = ciphertext.epoch();
+    let message_secrets =
+        if let Some(secrets) = secrets_store.secrets_for_epoch_mut(epoch) {
+            secrets
+        } else if epoch.as_u64() == secrets_store.current_epoch() {
+            secrets_store.message_secrets_mut()
+        } else {
+            return Err(MessageDecryptionError::EpochNotInStore);
+        };
+
+    // Decrypt sender data, then decrypt message content.
+    let sender_data = ciphertext.sender_data(message_secrets, crypto, ciphersuite)?;
+    let verifiable = ciphertext.to_verifiable_content(
+        ciphersuite,
+        crypto,
+        message_secrets,
+        sender_data.leaf_index,
+        &SenderRatchetConfiguration::default(),
+        sender_data,
+    )?;
+
+    verifiable
+        .into_application_bytes()
+        .ok_or(MessageDecryptionError::MalformedContent)
+}
+
+/// Extract the MLS epoch number from a TLS-encoded [`MlsMessageIn`].
+/// Returns an error string if the bytes cannot be parsed or are not a protocol message.
+pub fn extract_message_epoch(msg_tls: &[u8]) -> Result<u64, String> {
+    use crate::framing::{MlsMessageBodyIn, MlsMessageIn};
+    use tls_codec::Deserialize as _;
+
+    let msg = MlsMessageIn::tls_deserialize(&mut &msg_tls[..])
+        .map_err(|e| format!("TLS decode error: {e}"))?;
+    match msg.extract() {
+        MlsMessageBodyIn::PrivateMessage(m) => Ok(m.epoch().as_u64()),
+        MlsMessageBodyIn::PublicMessage(m) => Ok(m.epoch().as_u64()),
+        _ => Err("Not a protocol message".to_string()),
+    }
+}

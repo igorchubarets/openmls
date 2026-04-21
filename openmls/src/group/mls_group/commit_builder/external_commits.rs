@@ -204,6 +204,7 @@ impl ExternalCommitBuilder {
         let message_secrets_store = MessageSecretsStore::new_with_secret(
             config.past_epoch_deletion_policy(),
             message_secrets,
+            group_context.epoch(),
         );
 
         let external_init_proposal =

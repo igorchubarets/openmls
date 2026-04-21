@@ -10,7 +10,7 @@ use crate::{
     extensions::Extensions,
     group::{
         config::PastEpochDeletionPolicy, past_secrets::MessageSecretsStore,
-        public_group::errors::PublicGroupBuildError, GroupContext, GroupId, MlsGroup,
+        public_group::errors::PublicGroupBuildError, GroupContext, GroupEpoch, GroupId, MlsGroup,
         MlsGroupCreateConfig, MlsGroupCreateConfigBuilder, MlsGroupState, NewGroupError,
         PublicGroup, WireFormatPolicy,
     },
@@ -166,6 +166,7 @@ impl MlsGroupBuilder {
                 .join_config
                 .past_epoch_deletion_policy(),
             message_secrets,
+            GroupEpoch(0),
         );
 
         let public_group = public_group_builder

@@ -1,4 +1,4 @@
-use errors::{ExportGroupInfoError, ExportSecretError};
+use errors::{ExportGroupInfoError, ExportSecretError, ExportSecretsStoreError};
 use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer};
 
 #[cfg(feature = "extensions-draft-08")]
@@ -103,6 +103,55 @@ impl MlsGroup {
     /// Returns the resumption PSK secret of the current epoch.
     pub fn resumption_psk_secret(&self) -> &ResumptionPskSecret {
         self.group_epoch_secrets().resumption_psk()
+    }
+
+    /// Serialize and encrypt the current [`MessageSecretsStore`] to an opaque binary blob.
+    ///
+    /// Call this **once after every commit** (`merge_staged_commit` or
+    /// `StagedWelcome::into_group`).  The snapshot captures the newly-current
+    /// epoch's secrets plus any past epochs in the rolling window, so a single
+    /// post-merge export is sufficient to archive both the incoming and outgoing
+    /// epochs.
+    ///
+    /// The blob can be stored externally (e.g. uploaded to the server keyed by
+    /// the new epoch number) and later passed to
+    /// [`decrypt_application_message_with_stored_secrets`] to decrypt historical
+    /// messages without the full group state.
+    ///
+    /// # Format
+    /// `nonce (12 bytes, deterministic from epoch) || AEAD(group_key, postcard(MessageSecretsStore))`
+    ///
+    /// The nonce is derived from the *current* epoch number (8-byte little-endian,
+    /// zero-padded to the AEAD nonce length).  The AEAD algorithm is taken from
+    /// `self.ciphersuite()`.
+    ///
+    /// # Arguments
+    /// * `group_key` — Caller-supplied symmetric key whose length must match the
+    ///   AEAD key size for this group's ciphersuite (16 or 32 bytes).
+    /// * `crypto` — The `OpenMlsCrypto` provider used for AEAD operations.
+    pub fn export_message_secrets_store(
+        &self,
+        group_key: &[u8],
+        crypto: &impl OpenMlsCrypto,
+    ) -> Result<Vec<u8>, ExportSecretsStoreError> {
+        let aead_type = self.ciphersuite().aead_algorithm();
+        let epoch = self.epoch().as_u64();
+
+        // Deterministic nonce: epoch as 8-byte LE, zero-padded to 12 bytes.
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&epoch.to_le_bytes());
+
+        let plaintext =
+            postcard::to_allocvec(&self.message_secrets_store).map_err(ExportSecretsStoreError::Serialize)?;
+
+        let ciphertext = crypto
+            .aead_encrypt(aead_type, group_key, &plaintext, &nonce, &[])
+            .map_err(|_| ExportSecretsStoreError::Crypto)?;
+
+        let mut out = Vec::with_capacity(12 + ciphertext.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
     }
 
     /// Returns a resumption psk for a given epoch. If no resumption psk
