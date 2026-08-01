@@ -98,6 +98,7 @@ use crate::{
     group::*,
     messages::proposals::{Proposal, RemoveProposal},
     schedule::{EncryptionSecret, SenderDataSecret},
+    ciphersuite::Secret,
     storage::OpenMlsProvider,
     test_utils::bytes_to_hex,
     tree::{
@@ -614,6 +615,7 @@ pub fn run_test_vector(
                     .tls_serialize_detached()
                     .unwrap(),
                 fresh_secret_tree.clone(),
+                Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness."), // we don't care about this value
             );
 
             // Decrypt and check application message

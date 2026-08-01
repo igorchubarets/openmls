@@ -24,8 +24,14 @@ use super::*;
 ///     opaque authenticated_data<V>;
 ///     opaque encrypted_sender_data<V>;
 ///     opaque ciphertext<V>;
+///     opaque key_enc<V>; // Yourn extension: per-message wrapped content key
 /// } PrivateMessage;
 /// ```
+///
+/// The `key_enc` field is a non-standard extension. The sender wraps the
+/// content ratchet key material (key ‖ nonce) under the epoch wrap key, so
+/// any member can later decrypt the message from the stored epoch-secret blob
+/// alone — own messages included — without live ratchet state.
 #[derive(
     Debug, PartialEq, Eq, Clone, TlsSerialize, TlsSize, serde::Serialize, serde::Deserialize,
 )]
@@ -36,6 +42,7 @@ pub struct PrivateMessage {
     pub(crate) authenticated_data: VLBytes,
     pub(crate) encrypted_sender_data: VLBytes,
     pub(crate) ciphertext: VLBytes,
+    pub(crate) key_enc: VLBytes,
 }
 
 pub(crate) struct MlsMessageHeader {
@@ -53,6 +60,7 @@ impl PrivateMessage {
         authenticated_data: VLBytes,
         encrypted_sender_data: VLBytes,
         ciphertext: VLBytes,
+        key_enc: VLBytes,
     ) -> Self {
         Self {
             group_id,
@@ -61,6 +69,7 @@ impl PrivateMessage {
             authenticated_data,
             encrypted_sender_data,
             ciphertext,
+            key_enc,
         }
     }
 
@@ -176,6 +185,26 @@ impl PrivateMessage {
             .secret_tree_mut()
             // Even in tests we want to use the real sender index, so we have a key to encrypt.
             .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?;
+        // Wrap the ratchet key material (key ‖ nonce) under the epoch wrap
+        // key, so the message can be decrypted from a stored epoch-secret blob
+        // at any time — own messages included — without live ratchet state.
+        // Only the sender does this; members unwrap the same bytes with the
+        // wrap key from their own blob. Empty for non-application messages.
+        let key_enc = if public_message.content().content_type().is_application_message() {
+            let key_enc_nonce = message_secrets
+                .key_enc_nonce(crypto, ciphersuite, sender_index, generation)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
+                .aead_seal(
+                    crypto,
+                    &[ratchet_key.as_slice(), ratchet_nonce.as_slice()].concat(),
+                    &[],
+                    &key_enc_nonce,
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?
+        } else {
+            Vec::new()
+        };
         // Sample reuse guard uniformly at random.
         let reuse_guard: ReuseGuard =
             ReuseGuard::try_from_random(rand).map_err(LibraryError::unexpected_crypto_error)?;
@@ -251,6 +280,7 @@ impl PrivateMessage {
             authenticated_data: public_message.authenticated_data().into(),
             encrypted_sender_data: encrypted_sender_data.into(),
             ciphertext: ciphertext.into(),
+            key_enc: key_enc.into(),
         })
     }
 

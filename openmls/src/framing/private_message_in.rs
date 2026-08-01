@@ -31,6 +31,7 @@ use super::*;
 ///     opaque authenticated_data<V>;
 ///     opaque encrypted_sender_data<V>;
 ///     opaque ciphertext<V>;
+///     opaque key_enc<V>; // Yourn extension: per-message wrapped content key
 /// } PrivateMessage;
 /// ```
 #[derive(
@@ -43,6 +44,7 @@ pub struct PrivateMessageIn {
     authenticated_data: VLBytes,
     encrypted_sender_data: VLBytes,
     ciphertext: VLBytes,
+    key_enc: VLBytes,
 }
 
 impl PrivateMessageIn {
@@ -206,6 +208,50 @@ impl PrivateMessageIn {
         Ok(verifiable)
     }
 
+    /// Like [`Self::to_verifiable_content`], but decrypts the content with
+    /// caller-supplied key material instead of deriving it from the secret
+    /// tree. Used by the stored-secrets path to decrypt a message — the
+    /// sender's own included — directly from the per-message wrapped key
+    /// material, without touching the ratchet.
+    pub(crate) fn to_verifiable_content_from_content_key(
+        &self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        content_key: AeadKey,
+        prepared_nonce: AeadNonce,
+        sender_data: MlsSenderData,
+        serialized_context: &[u8],
+    ) -> Result<VerifiableAuthenticatedContentIn, MessageDecryptionError> {
+        let private_message_content = self.decrypt(crypto, content_key, &prepared_nonce)?;
+
+        // Extract sender. The sender type is always of type Member for PrivateMessage.
+        let sender = Sender::from_sender_data(sender_data);
+        log_content!(
+            trace,
+            "  Successfully decoded PublicMessage with: {:x?}",
+            private_message_content.content
+        );
+
+        let verifiable = VerifiableAuthenticatedContentIn::new(
+            WireFormat::PrivateMessage,
+            FramedContentIn {
+                group_id: self.group_id.clone(),
+                epoch: self.epoch,
+                sender,
+                authenticated_data: self.authenticated_data.clone(),
+                body: private_message_content.content,
+            },
+            Some(serialized_context.to_vec()),
+            private_message_content.auth,
+        );
+        Ok(verifiable)
+    }
+
+    /// Get the `key_enc` bytes (the per-message wrapped content key material).
+    pub(crate) fn key_enc(&self) -> &[u8] {
+        self.key_enc.as_slice()
+    }
+
     /// Get the `group_id` in the `PrivateMessage`.
     pub(crate) fn group_id(&self) -> &GroupId {
         &self.group_id
@@ -272,6 +318,7 @@ impl From<PrivateMessageIn> for PrivateMessage {
             authenticated_data: value.authenticated_data,
             encrypted_sender_data: value.encrypted_sender_data,
             ciphertext: value.ciphertext,
+            key_enc: value.key_enc,
         }
     }
 }
@@ -286,6 +333,7 @@ impl From<PrivateMessage> for PrivateMessageIn {
             authenticated_data: value.authenticated_data,
             encrypted_sender_data: value.encrypted_sender_data,
             ciphertext: value.ciphertext,
+            key_enc: value.key_enc,
         }
     }
 }

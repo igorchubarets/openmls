@@ -315,6 +315,7 @@ fn bad_padding() {
                 plaintext.authenticated_data().into(),
                 encrypted_sender_data.into(),
                 ciphertext.into(),
+                Vec::new().into(),
             )
         };
 

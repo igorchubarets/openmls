@@ -214,4 +214,9 @@ impl ContentType {
     pub(crate) fn is_handshake_message(&self) -> bool {
         self == &ContentType::Proposal || self == &ContentType::Commit
     }
+
+    /// Returns `true` if this is an application message and `false` otherwise.
+    pub(crate) fn is_application_message(&self) -> bool {
+        self == &ContentType::Application
+    }
 }

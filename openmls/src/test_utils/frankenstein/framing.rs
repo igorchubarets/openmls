@@ -233,11 +233,12 @@ pub enum FrankenFramedContentBody {
 )]
 pub struct FrankenPrivateMessage {
     pub group_id: VLBytes,
-    pub epoch: VLBytes,
+    pub epoch: u64,
     pub content_type: FrankenContentType,
     pub authenticated_data: VLBytes,
     pub encrypted_sender_data: VLBytes,
     pub ciphertext: VLBytes,
+    pub key_enc: VLBytes,
 }
 
 #[derive(

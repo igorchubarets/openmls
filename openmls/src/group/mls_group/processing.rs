@@ -717,6 +717,13 @@ impl MlsGroup {
 /// # Returns
 /// The raw application plaintext bytes on success.
 ///
+/// If the message carries the Yourn `key_enc` extension (the sender's wrapped
+/// content key material), it is unwrapped with the epoch's wrap key and used
+/// to decrypt the content directly, bypassing the secret tree. This also
+/// works for the sender's own messages and never consumes ratchet state, so
+/// repeated decryption is idempotent. Messages without `key_enc` use the
+/// regular stored-secrets ratchet path.
+///
 /// # Errors
 /// Returns a [`MessageDecryptionError`] if the blob cannot be decrypted /
 /// decoded, or if the epoch is not present in the snapshot.
@@ -727,6 +734,8 @@ pub fn decrypt_application_message_with_stored_secrets(
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
 ) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+    use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
+    use crate::error::LibraryError;
     use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
     use crate::group::mls_group::past_secrets::MessageSecretsStore;
     use tls_codec::Deserialize as _;
@@ -768,16 +777,51 @@ pub fn decrypt_application_message_with_stored_secrets(
             return Err(MessageDecryptionError::EpochNotInStore);
         };
 
-    // Decrypt sender data, then decrypt message content.
+    // Decrypt sender data.
     let sender_data = ciphertext.sender_data(message_secrets, crypto, ciphersuite)?;
-    let verifiable = ciphertext.to_verifiable_content(
-        ciphersuite,
-        crypto,
-        message_secrets,
-        sender_data.leaf_index,
-        &SenderRatchetConfiguration::default(),
-        sender_data,
-    )?;
+    // If the message carries per-message wrapped key material, unwrap it with
+    // the epoch's wrap key and decrypt the content directly. This bypasses
+    // the secret tree, so it also works for the sender's own messages (the
+    // stored tree holds an encryption ratchet for the own leaf) and never
+    // consumes ratchet state — repeated decryption is idempotent.
+    let verifiable = if !ciphertext.key_enc().is_empty() {
+        if !ciphertext.content_type().is_application_message() {
+            return Err(MessageDecryptionError::MalformedContent);
+        }
+        let key_enc_nonce = message_secrets
+            .key_enc_nonce(crypto, ciphersuite, sender_data.leaf_index, sender_data.generation)
+            .map_err(LibraryError::unexpected_crypto_error)?;
+        let wrapped = AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
+            .aead_open(crypto, ciphertext.key_enc(), &[], &key_enc_nonce)
+            .map_err(|_| MessageDecryptionError::AeadError)?;
+        // Split the unwrapped content key material into key and nonce. The
+        // length must match exactly — AeadNonce::from_secret panics otherwise.
+        if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
+            return Err(MessageDecryptionError::MalformedContent);
+        }
+        let (key_bytes, nonce_bytes) = wrapped.split_at(ciphersuite.aead_key_length());
+        let content_key = AeadKey::from_secret(Secret::from_slice(key_bytes), ciphersuite);
+        let content_nonce = AeadNonce::from_secret(Secret::from_slice(nonce_bytes));
+        // Prepare the nonce by xoring with the reuse guard (mirrors the send path).
+        let prepared_nonce = content_nonce.xor_with_reuse_guard(&sender_data.reuse_guard);
+        ciphertext.to_verifiable_content_from_content_key(
+            ciphersuite,
+            crypto,
+            content_key,
+            prepared_nonce,
+            sender_data,
+            message_secrets.serialized_context(),
+        )?
+    } else {
+        ciphertext.to_verifiable_content(
+            ciphersuite,
+            crypto,
+            message_secrets,
+            sender_data.leaf_index,
+            &SenderRatchetConfiguration::default(),
+            sender_data,
+        )?
+    };
 
     verifiable
         .into_application_bytes()

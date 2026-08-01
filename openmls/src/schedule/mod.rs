@@ -1078,6 +1078,11 @@ pub(crate) struct EpochSecrets {
     confirmation_key: ConfirmationKey,
     membership_key: MembershipKey,
     resumption_psk: ResumptionPskSecret,
+    /// Per-epoch wrap key, derived from the exporter secret. The key schedule
+    /// is identical for every member, so this value is the same in every
+    /// member's epoch-secret blob — which is what lets each member
+    /// independently unwrap the single per-message `keyEnc`.
+    wrap_key: Secret,
 }
 
 impl std::fmt::Debug for EpochSecrets {
@@ -1104,6 +1109,7 @@ impl PartialEq for EpochSecrets {
             && self.confirmation_key == other.confirmation_key
             && self.membership_key == other.membership_key
             && self.resumption_psk == other.resumption_psk
+            && self.wrap_key == other.wrap_key
     }
 }
 
@@ -1182,6 +1188,17 @@ impl EpochSecrets {
         let confirmation_key = ConfirmationKey::new(crypto, ciphersuite, &epoch_secret)?;
         let membership_key = MembershipKey::new(crypto, ciphersuite, &epoch_secret)?;
         let resumption_psk = ResumptionPskSecret::new(crypto, ciphersuite, &epoch_secret)?;
+        // Derive the per-epoch message-wrap key from the exporter secret
+        // (byte-identical to `MlsGroup::export_secret("yourn_msg_wrap", &[])`).
+        let wrap_key = Secret::from_slice(
+            &exporter_secret.derive_exported_secret(
+                ciphersuite,
+                crypto,
+                "yourn_msg_wrap",
+                &[],
+                ciphersuite.aead_key_length(),
+            )?,
+        );
 
         log::trace!("  Computing init secret.");
         let init_secret = InitSecret::new(crypto, ciphersuite, epoch_secret)?;
@@ -1196,6 +1213,7 @@ impl EpochSecrets {
             confirmation_key,
             membership_key,
             resumption_psk,
+            wrap_key,
         })
     }
 
@@ -1243,6 +1261,7 @@ impl EpochSecrets {
                 self.confirmation_key,
                 serialized_context,
                 secret_tree,
+                self.wrap_key,
             ),
         )
     }

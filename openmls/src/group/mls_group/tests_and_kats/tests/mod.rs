@@ -7,3 +7,4 @@ mod past_secrets;
 mod past_secrets_storage_compatibility;
 mod proposals;
 mod secret_tree_persistence;
+mod stored_secrets;
