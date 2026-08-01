@@ -24,7 +24,6 @@ pub(crate) struct MessageSecretsWithTimestamp {
     #[cfg_attr(target_arch = "wasm32", serde(skip))]
     added_at: Option<SystemTime>,
     /// The message secrets
-    #[serde(flatten)]
     message_secrets: MessageSecrets,
 }
 
