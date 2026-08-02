@@ -734,19 +734,8 @@ pub fn decrypt_application_message_with_stored_secrets(
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
 ) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
-    use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
-    use crate::error::LibraryError;
-    use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
+    use crate::framing::errors::MessageDecryptionError;
     use crate::group::mls_group::past_secrets::MessageSecretsStore;
-    use tls_codec::Deserialize as _;
-
-    // Decode the MLS ciphertext first (we need the epoch for nonce reconstruction).
-    let mls_msg = MlsMessageIn::tls_deserialize(&mut &ciphertext_tls[..])
-        .map_err(|_| MessageDecryptionError::MalformedContent)?;
-    let ciphertext = match mls_msg.extract() {
-        MlsMessageBodyIn::PrivateMessage(ct) => ct,
-        _ => return Err(MessageDecryptionError::MalformedContent),
-    };
 
     // Decrypt the MessageSecretsStore blob.
     // Format: nonce (12 bytes) || AEAD ciphertext+tag
@@ -762,6 +751,35 @@ pub fn decrypt_application_message_with_stored_secrets(
     // Deserialize the captured MessageSecretsStore.
     let mut secrets_store: MessageSecretsStore =
         postcard::from_bytes(&plaintext).map_err(|_| MessageDecryptionError::MalformedContent)?;
+
+    decrypt_application_message_from_store(&mut secrets_store, ciphertext_tls, ciphersuite, crypto)
+}
+
+/// Shared decryption core: decrypt an application message using a captured
+/// [`MessageSecretsStore`] snapshot for the target epoch.
+///
+/// The store is consumed mutably (the non-key_enc path advances the ratchet).
+/// Callers that must not mutate live group state (the live-group path) pass a
+/// detached copy — see [`MlsGroup::decrypt_application_message_with_live_secrets`].
+fn decrypt_application_message_from_store(
+    secrets_store: &mut MessageSecretsStore,
+    ciphertext_tls: &[u8],
+    ciphersuite: openmls_traits::types::Ciphersuite,
+    crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+    use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
+    use crate::error::LibraryError;
+    use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
+    use crate::group::mls_group::past_secrets::MessageSecretsStore;
+    use tls_codec::Deserialize as _;
+
+    // Decode the MLS ciphertext first (we need the epoch for nonce reconstruction).
+    let mls_msg = MlsMessageIn::tls_deserialize(&mut &ciphertext_tls[..])
+        .map_err(|_| MessageDecryptionError::MalformedContent)?;
+    let ciphertext = match mls_msg.extract() {
+        MlsMessageBodyIn::PrivateMessage(ct) => ct,
+        _ => return Err(MessageDecryptionError::MalformedContent),
+    };
 
     // Find the right MessageSecrets: check past_epoch_trees first, then check
     // if the epoch matches the current (most-recent) snapshot epoch.
@@ -826,6 +844,45 @@ pub fn decrypt_application_message_with_stored_secrets(
     verifiable
         .into_application_bytes()
         .ok_or(MessageDecryptionError::MalformedContent)
+}
+
+impl MlsGroup {
+    /// Decrypt an application message with the LIVE group's current-epoch
+    /// [`MessageSecretsStore`] — no group key, no stored blob, no fetch.
+    ///
+    /// Works on a detached copy of the live store: the fallback must not
+    /// consume or advance the live group's ratchet state (the sender still
+    /// encrypts with it). Returns [`MessageDecryptionError::EpochNotInStore`]
+    /// when the message is not from the current epoch — the caller should fall
+    /// back to the server-stored epoch-secret path.
+    pub fn decrypt_application_message_with_live_secrets(
+        &self,
+        ciphertext_tls: &[u8],
+        crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+    ) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+        use crate::framing::errors::MessageDecryptionError;
+        use crate::group::mls_group::past_secrets::MessageSecretsStore;
+
+        let epoch = extract_message_epoch(ciphertext_tls)
+            .map_err(|_| MessageDecryptionError::MalformedContent)?;
+        if epoch != self.epoch().as_u64() {
+            return Err(MessageDecryptionError::EpochNotInStore);
+        }
+
+        // Detached copy of the current epoch's store (serialize/deserialize —
+        // Clone is only derived under test-utils).
+        let store_bytes = postcard::to_allocvec(&self.message_secrets_store)
+            .map_err(|_| MessageDecryptionError::MalformedContent)?;
+        let mut store: MessageSecretsStore =
+            postcard::from_bytes(&store_bytes).map_err(|_| MessageDecryptionError::MalformedContent)?;
+
+        decrypt_application_message_from_store(
+            &mut store,
+            ciphertext_tls,
+            self.ciphersuite(),
+            crypto,
+        )
+    }
 }
 
 /// Extract the MLS epoch number from a TLS-encoded [`MlsMessageIn`].
