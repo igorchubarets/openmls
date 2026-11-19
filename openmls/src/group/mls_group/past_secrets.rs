@@ -469,18 +469,15 @@ pub(crate) fn encode_history_archive(
 pub(crate) fn decode_history_archive(
     plaintext: &[u8],
 ) -> Result<(MessageSecretsStore, Vec<Member>), postcard::Error> {
-    if plaintext.len() >= 20 && &plaintext[..16] == HISTORY_ARCHIVE_MAGIC {
-        let store_len = u32::from_le_bytes(plaintext[16..20].try_into().expect("length checked")) as usize;
-        let store_end = 20usize.saturating_add(store_len);
-        if store_end > plaintext.len() {
-            return Err(postcard::Error::DeserializeUnexpectedEnd);
-        }
-        let store = postcard::from_bytes(&plaintext[20..store_end])?;
-        let leaves = postcard::from_bytes(&plaintext[store_end..])?;
-        return Ok((store, leaves));
+    if plaintext.len() < 20 || &plaintext[..16] != HISTORY_ARCHIVE_MAGIC {
+        return Err(postcard::Error::DeserializeUnexpectedEnd);
     }
-    // Legacy unversioned store: no public leaves were archived. Verification
-    // will fail closed for current-epoch messages; past epochs still carry
-    // their own leaves in the store.
-    Ok((postcard::from_bytes(plaintext)?, Vec::new()))
+    let store_len = u32::from_le_bytes(plaintext[16..20].try_into().expect("length checked")) as usize;
+    let store_end = 20usize.saturating_add(store_len);
+    if store_end > plaintext.len() {
+        return Err(postcard::Error::DeserializeUnexpectedEnd);
+    }
+    let store = postcard::from_bytes(&plaintext[20..store_end])?;
+    let leaves = postcard::from_bytes(&plaintext[store_end..])?;
+    Ok((store, leaves))
 }

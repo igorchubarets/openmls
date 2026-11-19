@@ -745,28 +745,15 @@ pub fn decrypt_application_message_with_stored_secrets(
     // with a random nonce. Legacy blobs have no version prefix and no AAD; they
     // remain readable only for past epochs whose leaves were already archived.
     let aead_type = ciphersuite.aead_algorithm();
-    let (nonce_bytes, ct_tag, aad) = if encrypted_secrets
-        .starts_with(super::past_secrets::HISTORY_ENVELOPE_MAGIC)
+    let header_len = super::past_secrets::HISTORY_ENVELOPE_MAGIC.len();
+    let nonce_len = ciphersuite.aead_nonce_length();
+    if !encrypted_secrets.starts_with(super::past_secrets::HISTORY_ENVELOPE_MAGIC)
+        || encrypted_secrets.len() < header_len + nonce_len
     {
-        let header_len = super::past_secrets::HISTORY_ENVELOPE_MAGIC.len();
-        let nonce_len = ciphersuite.aead_nonce_length();
-        if encrypted_secrets.len() < header_len + nonce_len {
-            return Err(MessageDecryptionError::MalformedContent);
-        }
-        let (nonce, ciphertext) =
-            encrypted_secrets[header_len..].split_at(nonce_len);
-        (
-            nonce,
-            ciphertext,
-            super::past_secrets::history_archive_aad(group_id, epoch, key_version),
-        )
-    } else {
-        if encrypted_secrets.len() < 12 {
-            return Err(MessageDecryptionError::MalformedContent);
-        }
-        let (nonce, ciphertext) = encrypted_secrets.split_at(12);
-        (nonce, ciphertext, Vec::new())
-    };
+        return Err(MessageDecryptionError::MalformedContent);
+    }
+    let (nonce_bytes, ct_tag) = encrypted_secrets[header_len..].split_at(nonce_len);
+    let aad = super::past_secrets::history_archive_aad(group_id, epoch, key_version);
     let plaintext = crypto
         .aead_decrypt(aead_type, group_key, ct_tag, nonce_bytes, &aad)
         .map_err(|_| MessageDecryptionError::MalformedContent)?;
@@ -776,6 +763,9 @@ pub fn decrypt_application_message_with_stored_secrets(
     let (mut secrets_store, current_leaves): (MessageSecretsStore, Vec<Member>) =
         super::past_secrets::decode_history_archive(&plaintext)
             .map_err(|_| MessageDecryptionError::MalformedContent)?;
+    if current_leaves.is_empty() {
+        return Err(MessageDecryptionError::MalformedContent);
+    }
 
     decrypt_application_message_from_store(
         &mut secrets_store,
@@ -810,7 +800,7 @@ fn decrypt_application_message_from_store(
         .map_err(|_| MessageDecryptionError::MalformedContent)?;
     let ciphertext = match mls_msg.extract() {
         MlsMessageBodyIn::PrivateMessage(ct) => ct,
-        _ => return Err(MessageDecryptionError::MalformedContent),
+        _ => return Err(MessageDecryptionError::NotApplicationContent),
     };
 
     // Find the right MessageSecrets: check past_epoch_trees first, then check
@@ -829,49 +819,35 @@ fn decrypt_application_message_from_store(
 
     // Decrypt sender data.
     let sender_data = ciphertext.sender_data(message_secrets, crypto, ciphersuite)?;
-    // If the message carries per-message wrapped key material, unwrap it with
-    // the epoch's wrap key and decrypt the content directly. This bypasses
-    // the secret tree, so it also works for the sender's own messages (the
-    // stored tree holds an encryption ratchet for the own leaf) and never
-    // consumes ratchet state — repeated decryption is idempotent.
-    let verifiable = if !ciphertext.key_enc().is_empty() {
-        if !ciphertext.content_type().is_application_message() {
-            return Err(MessageDecryptionError::MalformedContent);
-        }
-        let key_enc_nonce = message_secrets
-            .key_enc_nonce(crypto, ciphersuite, sender_data.leaf_index, sender_data.generation)
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        let wrapped = AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
-            .aead_open(crypto, ciphertext.key_enc(), &[], &key_enc_nonce)
-            .map_err(|_| MessageDecryptionError::AeadError)?;
-        // Split the unwrapped content key material into key and nonce. The
-        // length must match exactly — AeadNonce::from_secret panics otherwise.
-        if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
-            return Err(MessageDecryptionError::MalformedContent);
-        }
-        let (key_bytes, nonce_bytes) = wrapped.split_at(ciphersuite.aead_key_length());
-        let content_key = AeadKey::from_secret(Secret::from_slice(key_bytes), ciphersuite);
-        let content_nonce = AeadNonce::from_secret(Secret::from_slice(nonce_bytes));
-        // Prepare the nonce by xoring with the reuse guard (mirrors the send path).
-        let prepared_nonce = content_nonce.xor_with_reuse_guard(&sender_data.reuse_guard);
-        ciphertext.to_verifiable_content_from_content_key(
-            ciphersuite,
-            crypto,
-            content_key,
-            prepared_nonce,
-            sender_data,
-            message_secrets.serialized_context(),
-        )?
-    } else {
-        ciphertext.to_verifiable_content(
-            ciphersuite,
-            crypto,
-            message_secrets,
-            sender_data.leaf_index,
-            &SenderRatchetConfiguration::default(),
-            sender_data,
-        )?
-    };
+    // Every application message carries per-message wrapped key material.
+    // Empty key_enc is not a legacy ratchet fallback; it is malformed.
+    if !ciphertext.content_type().is_application_message() {
+        return Err(MessageDecryptionError::NotApplicationContent);
+    }
+    if ciphertext.key_enc().is_empty() {
+        return Err(MessageDecryptionError::MalformedContent);
+    }
+    let key_enc_nonce = message_secrets
+        .key_enc_nonce(crypto, ciphersuite, sender_data.leaf_index, sender_data.generation)
+        .map_err(LibraryError::unexpected_crypto_error)?;
+    let wrapped = AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
+        .aead_open(crypto, ciphertext.key_enc(), &[], &key_enc_nonce)
+        .map_err(|_| MessageDecryptionError::AeadError)?;
+    if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
+        return Err(MessageDecryptionError::MalformedContent);
+    }
+    let (key_bytes, nonce_bytes) = wrapped.split_at(ciphersuite.aead_key_length());
+    let content_key = AeadKey::from_secret(Secret::from_slice(key_bytes), ciphersuite);
+    let content_nonce = AeadNonce::from_secret(Secret::from_slice(nonce_bytes));
+    let prepared_nonce = content_nonce.xor_with_reuse_guard(&sender_data.reuse_guard);
+    let verifiable = ciphertext.to_verifiable_content_from_content_key(
+        ciphersuite,
+        crypto,
+        content_key,
+        prepared_nonce,
+        sender_data,
+        message_secrets.serialized_context(),
+    )?;
 
     // Authenticate the inner MLS sender before exposing application plaintext.
     // The key_enc path decrypts the content but does not consume the ratchet,

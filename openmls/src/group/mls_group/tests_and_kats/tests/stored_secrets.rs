@@ -365,34 +365,4 @@ fn forged_sender_signature_rejected_in_live_and_stored_paths() {
     let _ = alice_credential;
 }
 
-/// A message without `key_enc` (legacy) still decrypts via the stored ratchet
-/// path, as before.
-#[openmls_test::openmls_test]
-fn legacy_message_without_key_enc_uses_ratchet_path() {
-    let provider = &Provider::default();
-    let bob_provider = &Provider::default();
-    let (_alice_credential, bob_credential, mut alice_group, mut bob_group) =
-        setup_two_member_group(ciphersuite, provider, bob_provider);
-    let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
-    let bob_msg = bob_group
-        .create_message(provider, &bob_credential.signer, b"from bob")
-        .expect("Error creating message.");
-    let legacy_bytes = with_key_enc(&bob_msg, Vec::new());
-
-    let alice_blob = alice_group
-        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
-        .expect("Error exporting message secrets.");
-    let plaintext = decrypt_application_message_with_stored_secrets(
-        &alice_blob,
-        &group_key,
-        alice_group.group_id().as_slice(),
-        alice_group.epoch().as_u64(),
-        1,
-        &legacy_bytes,
-        ciphersuite,
-        provider.crypto(),
-    )
-    .expect("Legacy message must decrypt via the stored ratchet path.");
-    assert_eq!(plaintext, b"from bob");
-}

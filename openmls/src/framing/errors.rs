@@ -25,6 +25,9 @@ pub enum MessageDecryptionError {
     /// The MLS sender signature did not verify against the sender leaf.
     #[error("The MLS sender signature did not verify.")]
     InvalidSignature,
+    /// The frame is not an application message and must use normal MLS processing.
+    #[error("NotApplicationContent")]
+    NotApplicationContent,
     /// The WireFormat was not PrivateMessage.
     #[error("The WireFormat was not PrivateMessage.")]
     WrongWireFormat,
