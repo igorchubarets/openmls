@@ -302,6 +302,58 @@ fn archive_exports_use_fresh_nonce_and_aad_binding() {
     assert_eq!(plaintext, b"aad-bound");
 }
 
+/// Pre-launch hardening: unversioned archives and application messages without
+/// key_enc are rejected; there is no legacy ratchet fallback.
+#[openmls_test::openmls_test]
+fn unversioned_archive_and_empty_key_enc_rejected() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (alice_credential, _bob_credential, mut alice_group, _bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let group_key = vec![0u8; ciphersuite.aead_key_length()];
+
+    let msg = alice_group
+        .create_message(provider, &alice_credential.signer, b"no legacy")
+        .expect("Error creating message.");
+    let msg_bytes = msg.tls_serialize_detached().expect("serialize");
+    let blob = alice_group
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
+        .expect("export");
+
+    let mut unversioned = blob.clone();
+    unversioned[0] ^= 0xff;
+    assert!(
+        decrypt_application_message_with_stored_secrets(
+            &unversioned,
+            &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
+            &msg_bytes,
+            ciphersuite,
+            provider.crypto(),
+        )
+        .is_err(),
+        "unversioned archive must fail closed"
+    );
+
+    let missing_key_enc = with_key_enc(&msg, Vec::new());
+    assert!(
+        decrypt_application_message_with_stored_secrets(
+            &blob,
+            &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
+            &missing_key_enc,
+            ciphersuite,
+            provider.crypto(),
+        )
+        .is_err(),
+        "application message without key_enc must fail closed"
+    );
+}
+
 /// A member cannot attribute an application message to another member by
 /// signing it with their own leaf key. The MLS signature must match the inner
 /// sender leaf before plaintext is returned, on both live and stored-secrets
