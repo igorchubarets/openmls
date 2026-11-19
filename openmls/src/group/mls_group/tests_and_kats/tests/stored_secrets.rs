@@ -10,7 +10,10 @@
 //! consumed.
 
 use crate::{
-    framing::{MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, PrivateMessage},
+    framing::{
+        mls_auth_content::AuthenticatedContent, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+        PrivateMessage,
+    },
     group::decrypt_application_message_with_stored_secrets,
     prelude::{
         tests_and_kats::utils::{generate_credential_with_key, CredentialWithKeyAndSigner},
@@ -119,12 +122,15 @@ fn own_message_decrypts_from_stored_secrets() {
         .expect("Error creating message.");
     let msg_bytes = msg.tls_serialize_detached().unwrap();
     let blob = alice_group
-        .export_message_secrets_store(&group_key, provider.crypto())
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
         .expect("Error exporting message secrets.");
 
     let plaintext = decrypt_application_message_with_stored_secrets(
         &blob,
         &group_key,
+        alice_group.group_id().as_slice(),
+        alice_group.epoch().as_u64(),
+        1,
         &msg_bytes,
         ciphersuite,
         provider.crypto(),
@@ -136,6 +142,9 @@ fn own_message_decrypts_from_stored_secrets() {
     let plaintext_again = decrypt_application_message_with_stored_secrets(
         &blob,
         &group_key,
+        alice_group.group_id().as_slice(),
+        alice_group.epoch().as_u64(),
+        1,
         &msg_bytes,
         ciphersuite,
         provider.crypto(),
@@ -161,11 +170,14 @@ fn every_members_blob_decrypts_the_message() {
 
     for group in [&alice_group, &bob_group] {
         let blob = group
-            .export_message_secrets_store(&group_key, provider.crypto())
+            .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
             .expect("Error exporting message secrets.");
         let plaintext = decrypt_application_message_with_stored_secrets(
             &blob,
             &group_key,
+            group.group_id().as_slice(),
+            group.epoch().as_u64(),
+            1,
             &msg_bytes,
             ciphersuite,
             provider.crypto(),
@@ -189,7 +201,7 @@ fn tampered_key_enc_rejected() {
         .create_message(provider, &alice_credential.signer, b"secret")
         .expect("Error creating message.");
     let blob = alice_group
-        .export_message_secrets_store(&group_key, provider.crypto())
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
         .expect("Error exporting message secrets.");
 
     // The original key_enc is opaque; grab its length to craft a same-length
@@ -211,6 +223,9 @@ fn tampered_key_enc_rejected() {
         decrypt_application_message_with_stored_secrets(
             &blob,
             &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
             &tampered_bytes,
             ciphersuite,
             provider.crypto(),
@@ -218,6 +233,136 @@ fn tampered_key_enc_rejected() {
         .is_err(),
         "Tampered key_enc must not decrypt."
     );
+}
+
+/// Epoch exports use a fresh nonce and bind room, epoch, and key version in
+/// the AAD.
+#[openmls_test::openmls_test]
+fn archive_exports_use_fresh_nonce_and_aad_binding() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (alice_credential, _bob_credential, mut alice_group, _bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let group_key = vec![0u8; ciphersuite.aead_key_length()];
+
+    let msg = alice_group
+        .create_message(provider, &alice_credential.signer, b"aad-bound")
+        .expect("Error creating message.");
+    let msg_bytes = msg.tls_serialize_detached().expect("serialize");
+    let blob_a = alice_group
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
+        .expect("export a");
+    let blob_b = alice_group
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
+        .expect("export b");
+
+    let magic = crate::group::mls_group::past_secrets::HISTORY_ENVELOPE_MAGIC;
+    let nonce_len = ciphersuite.aead_nonce_length();
+    assert_ne!(blob_a, blob_b, "fresh exports must differ");
+    assert_ne!(
+        blob_a[magic.len()..magic.len() + nonce_len],
+        blob_b[magic.len()..magic.len() + nonce_len],
+        "nonces must be fresh per export"
+    );
+
+    let group_id = alice_group.group_id().as_slice().to_vec();
+    let epoch = alice_group.epoch().as_u64();
+    for (wrong_group, wrong_epoch, wrong_version) in [
+        (b"other-group".as_slice(), epoch, 1),
+        (group_id.as_slice(), epoch + 1, 1),
+        (group_id.as_slice(), epoch, 2),
+    ] {
+        assert!(
+            decrypt_application_message_with_stored_secrets(
+                &blob_a,
+                &group_key,
+                wrong_group,
+                wrong_epoch,
+                wrong_version,
+                &msg_bytes,
+                ciphersuite,
+                provider.crypto(),
+            )
+            .is_err(),
+            "wrong AAD must fail"
+        );
+    }
+
+    let plaintext = decrypt_application_message_with_stored_secrets(
+        &blob_a,
+        &group_key,
+        &group_id,
+        epoch,
+        1,
+        &msg_bytes,
+        ciphersuite,
+        provider.crypto(),
+    )
+    .expect("correct AAD must decrypt");
+    assert_eq!(plaintext, b"aad-bound");
+}
+
+/// A member cannot attribute an application message to another member by
+/// signing it with their own leaf key. The MLS signature must match the inner
+/// sender leaf before plaintext is returned, on both live and stored-secrets
+/// paths.
+#[openmls_test::openmls_test]
+fn forged_sender_signature_rejected_in_live_and_stored_paths() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (alice_credential, bob_credential, mut alice_group, _bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let group_key = vec![0u8; ciphersuite.aead_key_length()];
+
+    // Claim Alice's leaf index, but sign with Bob's key.
+    let forged = AuthenticatedContent::new_application(
+        LeafNodeIndex::new(0),
+        &[],
+        b"forged as alice",
+        alice_group.export_group_context(),
+        &bob_credential.signer,
+    )
+    .expect("Could not build forged application content.");
+
+    let forged_private = PrivateMessage::encrypt_without_check::<<Provider as crate::storage::OpenMlsProvider>::StorageError>(
+        provider.crypto(),
+        provider.rand(),
+        &forged,
+        ciphersuite,
+        alice_group.message_secrets_test_mut(),
+        0,
+    )
+    .expect("Could not encrypt forged application content.");
+    let forged_bytes = MlsMessageOut::from_private_message(forged_private, ProtocolVersion::Mls10)
+        .tls_serialize_detached()
+        .expect("Could not serialize forged message.");
+
+    let blob = alice_group
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
+        .expect("Error exporting message secrets.");
+
+    assert!(
+        decrypt_application_message_with_stored_secrets(
+            &blob,
+            &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
+            &forged_bytes,
+            ciphersuite,
+            provider.crypto(),
+        )
+        .is_err(),
+        "Stored-secrets path accepted a forged sender signature."
+    );
+    assert!(
+        alice_group
+            .decrypt_application_message_with_live_secrets(&forged_bytes, provider.crypto())
+            .is_err(),
+        "Live-secrets path accepted a forged sender signature."
+    );
+
+    let _ = alice_credential;
 }
 
 /// A message without `key_enc` (legacy) still decrypts via the stored ratchet
@@ -236,11 +381,14 @@ fn legacy_message_without_key_enc_uses_ratchet_path() {
     let legacy_bytes = with_key_enc(&bob_msg, Vec::new());
 
     let alice_blob = alice_group
-        .export_message_secrets_store(&group_key, provider.crypto())
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
         .expect("Error exporting message secrets.");
     let plaintext = decrypt_application_message_with_stored_secrets(
         &alice_blob,
         &group_key,
+        alice_group.group_id().as_slice(),
+        alice_group.epoch().as_u64(),
+        1,
         &legacy_bytes,
         ciphersuite,
         provider.crypto(),

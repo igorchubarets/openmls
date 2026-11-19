@@ -67,6 +67,17 @@ impl AuthenticatedContentIn {
     }
 }
 
+impl AuthenticatedContentIn {
+    /// Extract application plaintext bytes after this content has been
+    /// signature-verified. This type is only produced by [`Verifiable::verify`].
+    pub(crate) fn into_application_bytes(self) -> Option<Vec<u8>> {
+        match self.content.body {
+            FramedContentBodyIn::Application(bytes) => Some(bytes.as_slice().to_vec()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(any(feature = "test-utils", test))]
 impl AuthenticatedContentIn {
     /// Get the content body of the message.
@@ -198,16 +209,6 @@ impl VerifiableAuthenticatedContentIn {
         self.tbs.content.proposals()
     }
 
-    /// Extract application plaintext bytes without signature verification.
-    /// Used for historical message decryption (scroll-back) where the message
-    /// was already authenticated when first received.
-    /// Returns `None` if this is not a `ContentType::Application` message.
-    pub(crate) fn into_application_bytes(self) -> Option<Vec<u8>> {
-        match self.tbs.content.body {
-            FramedContentBodyIn::Application(bytes) => Some(bytes.as_slice().to_vec()),
-            _ => None,
-        }
-    }
 }
 
 impl Verifiable for VerifiableAuthenticatedContentIn {

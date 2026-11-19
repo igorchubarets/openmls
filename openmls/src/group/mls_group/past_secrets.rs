@@ -144,6 +144,32 @@ impl MessageSecretsStore {
         }
     }
 
+    /// Resolve the signature key of a member at `epoch`. Current-epoch leaves
+    /// are supplied by the caller because they are not part of the secret
+    /// store; past epochs retain their own leaves.
+    pub(crate) fn member_for_epoch_with_current(
+        &self,
+        epoch: u64,
+        leaf_index: LeafNodeIndex,
+        current_leaves: &[Member],
+    ) -> Option<Member> {
+        if epoch == self.current_epoch {
+            return current_leaves
+                .iter()
+                .find(|member| member.index == leaf_index)
+                .cloned();
+        }
+        self.past_epoch_trees
+            .iter()
+            .find(|tree| tree.epoch == epoch)
+            .and_then(|tree| {
+                tree.leaves
+                    .iter()
+                    .find(|member| member.index == leaf_index)
+                    .cloned()
+            })
+    }
+
     /// Set the `message_secrets` to a provided `MessageSecrets`, and return
     /// the previous one.
     pub(crate) fn replace_current_message_secrets(
@@ -400,4 +426,61 @@ impl MessageSecretsStore {
     pub(crate) fn num_past_epoch_trees(&self) -> usize {
         self.past_epoch_trees.len()
     }
+}
+/// Versioned history-archive plaintext envelope. The secret store remains in
+/// its existing postcard format; public leaves travel beside it so decryption
+/// can verify MLS sender signatures without changing the serialized store.
+const HISTORY_ARCHIVE_MAGIC: &[u8; 16] = b"YRN-HISTORY-V1\0\0";
+
+/// Outer archive envelope magic and AAD. AAD binds the ciphertext to the room,
+/// epoch, and Group Key version so a blob cannot be moved between epochs or
+/// key versions.
+pub(crate) const HISTORY_ENVELOPE_MAGIC: &[u8; 16] = b"YRN-ARCHIVE-V2\0\0";
+
+pub(crate) fn history_archive_aad(
+    group_id: &[u8],
+    epoch: u64,
+    key_version: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(20 + group_id.len() + 12);
+    aad.extend_from_slice(b"YRN-HISTORY-AAD-V1");
+    aad.extend_from_slice(&(group_id.len() as u32).to_le_bytes());
+    aad.extend_from_slice(group_id);
+    aad.extend_from_slice(&epoch.to_le_bytes());
+    aad.extend_from_slice(&key_version.to_le_bytes());
+    aad
+}
+
+pub(crate) fn encode_history_archive(
+    store: &MessageSecretsStore,
+    current_leaves: &[Member],
+) -> Result<Vec<u8>, postcard::Error> {
+    let store_bytes = postcard::to_allocvec(store)?;
+    let leaves_bytes = postcard::to_allocvec(&current_leaves.to_vec())?;
+    let mut out = Vec::with_capacity(16 + 4 + store_bytes.len() + leaves_bytes.len());
+    out.extend_from_slice(HISTORY_ARCHIVE_MAGIC);
+    let store_len = u32::try_from(store_bytes.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&store_len.to_le_bytes());
+    out.extend_from_slice(&store_bytes);
+    out.extend_from_slice(&leaves_bytes);
+    Ok(out)
+}
+
+pub(crate) fn decode_history_archive(
+    plaintext: &[u8],
+) -> Result<(MessageSecretsStore, Vec<Member>), postcard::Error> {
+    if plaintext.len() >= 20 && &plaintext[..16] == HISTORY_ARCHIVE_MAGIC {
+        let store_len = u32::from_le_bytes(plaintext[16..20].try_into().expect("length checked")) as usize;
+        let store_end = 20usize.saturating_add(store_len);
+        if store_end > plaintext.len() {
+            return Err(postcard::Error::DeserializeUnexpectedEnd);
+        }
+        let store = postcard::from_bytes(&plaintext[20..store_end])?;
+        let leaves = postcard::from_bytes(&plaintext[store_end..])?;
+        return Ok((store, leaves));
+    }
+    // Legacy unversioned store: no public leaves were archived. Verification
+    // will fail closed for current-epoch messages; past epochs still carry
+    // their own leaves in the store.
+    Ok((postcard::from_bytes(plaintext)?, Vec::new()))
 }

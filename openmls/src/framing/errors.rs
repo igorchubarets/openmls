@@ -22,6 +22,9 @@ pub enum MessageDecryptionError {
     /// An error occurred during AEAD decryption.
     #[error("An error occurred during AEAD decryption.")]
     AeadError,
+    /// The MLS sender signature did not verify against the sender leaf.
+    #[error("The MLS sender signature did not verify.")]
+    InvalidSignature,
     /// The WireFormat was not PrivateMessage.
     #[error("The WireFormat was not PrivateMessage.")]
     WrongWireFormat,

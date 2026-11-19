@@ -6,6 +6,7 @@ use errors::{CommitToPendingProposalsError, MergePendingCommitError};
 use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer, storage::StorageProvider as _};
 
 use crate::{
+    ciphersuite::{signable::Verifiable, OpenMlsSignaturePublicKey, SignaturePublicKey},
     framing::mls_content::FramedContentBody,
     group::{errors::MergeCommitError, StageCommitError, ValidationError},
     messages::group_info::GroupInfo,
@@ -730,6 +731,9 @@ impl MlsGroup {
 pub fn decrypt_application_message_with_stored_secrets(
     encrypted_secrets: &[u8],
     group_key: &[u8],
+    group_id: &[u8],
+    epoch: u64,
+    key_version: u32,
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
@@ -737,22 +741,49 @@ pub fn decrypt_application_message_with_stored_secrets(
     use crate::framing::errors::MessageDecryptionError;
     use crate::group::mls_group::past_secrets::MessageSecretsStore;
 
-    // Decrypt the MessageSecretsStore blob.
-    // Format: nonce (12 bytes) || AEAD ciphertext+tag
-    if encrypted_secrets.len() < 12 {
-        return Err(MessageDecryptionError::MalformedContent);
-    }
-    let (nonce_bytes, ct_tag) = encrypted_secrets.split_at(12);
+    // New envelopes bind the archive to room, epoch, and Group Key version
+    // with a random nonce. Legacy blobs have no version prefix and no AAD; they
+    // remain readable only for past epochs whose leaves were already archived.
     let aead_type = ciphersuite.aead_algorithm();
+    let (nonce_bytes, ct_tag, aad) = if encrypted_secrets
+        .starts_with(super::past_secrets::HISTORY_ENVELOPE_MAGIC)
+    {
+        let header_len = super::past_secrets::HISTORY_ENVELOPE_MAGIC.len();
+        let nonce_len = ciphersuite.aead_nonce_length();
+        if encrypted_secrets.len() < header_len + nonce_len {
+            return Err(MessageDecryptionError::MalformedContent);
+        }
+        let (nonce, ciphertext) =
+            encrypted_secrets[header_len..].split_at(nonce_len);
+        (
+            nonce,
+            ciphertext,
+            super::past_secrets::history_archive_aad(group_id, epoch, key_version),
+        )
+    } else {
+        if encrypted_secrets.len() < 12 {
+            return Err(MessageDecryptionError::MalformedContent);
+        }
+        let (nonce, ciphertext) = encrypted_secrets.split_at(12);
+        (nonce, ciphertext, Vec::new())
+    };
     let plaintext = crypto
-        .aead_decrypt(aead_type, group_key, ct_tag, nonce_bytes, &[])
+        .aead_decrypt(aead_type, group_key, ct_tag, nonce_bytes, &aad)
         .map_err(|_| MessageDecryptionError::MalformedContent)?;
 
-    // Deserialize the captured MessageSecretsStore.
-    let mut secrets_store: MessageSecretsStore =
-        postcard::from_bytes(&plaintext).map_err(|_| MessageDecryptionError::MalformedContent)?;
+    // Deserialize the versioned archive. Legacy blobs carry the store alone;
+    // current-epoch sender verification will fail closed without leaves.
+    let (mut secrets_store, current_leaves): (MessageSecretsStore, Vec<Member>) =
+        super::past_secrets::decode_history_archive(&plaintext)
+            .map_err(|_| MessageDecryptionError::MalformedContent)?;
 
-    decrypt_application_message_from_store(&mut secrets_store, ciphertext_tls, ciphersuite, crypto)
+    decrypt_application_message_from_store(
+        &mut secrets_store,
+        &current_leaves,
+        ciphertext_tls,
+        ciphersuite,
+        crypto,
+    )
 }
 
 /// Shared decryption core: decrypt an application message using a captured
@@ -763,6 +794,7 @@ pub fn decrypt_application_message_with_stored_secrets(
 /// detached copy — see [`MlsGroup::decrypt_application_message_with_live_secrets`].
 fn decrypt_application_message_from_store(
     secrets_store: &mut MessageSecretsStore,
+    current_leaves: &[Member],
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
@@ -841,7 +873,25 @@ fn decrypt_application_message_from_store(
         )?
     };
 
-    verifiable
+    // Authenticate the inner MLS sender before exposing application plaintext.
+    // The key_enc path decrypts the content but does not consume the ratchet,
+    // so the signature is the only proof that the claimed sender leaf produced
+    // this content. This also applies to the stored-secrets path.
+    let leaf_index = verifiable
+        .sender()
+        .as_member()
+        .ok_or(MessageDecryptionError::MalformedContent)?;
+    let member = secrets_store
+        .member_for_epoch_with_current(epoch.as_u64(), leaf_index, current_leaves)
+        .ok_or(MessageDecryptionError::InvalidSignature)?;
+    let signature_key = OpenMlsSignaturePublicKey::from_signature_key(
+        SignaturePublicKey::from(member.signature_key.clone()),
+        ciphersuite.signature_algorithm(),
+    );
+    let authenticated = verifiable
+        .verify(crypto, &signature_key)
+        .map_err(|_| MessageDecryptionError::InvalidSignature)?;
+    authenticated
         .into_application_bytes()
         .ok_or(MessageDecryptionError::MalformedContent)
 }
@@ -875,9 +925,11 @@ impl MlsGroup {
             .map_err(|_| MessageDecryptionError::MalformedContent)?;
         let mut store: MessageSecretsStore =
             postcard::from_bytes(&store_bytes).map_err(|_| MessageDecryptionError::MalformedContent)?;
+        let current_leaves: Vec<Member> = self.public_group().members().collect();
 
         decrypt_application_message_from_store(
             &mut store,
+            &current_leaves,
             ciphertext_tls,
             self.ciphersuite(),
             crypto,

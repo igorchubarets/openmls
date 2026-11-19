@@ -1,5 +1,5 @@
 use errors::{ExportGroupInfoError, ExportSecretError, ExportSecretsStoreError};
-use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer};
+use openmls_traits::{crypto::OpenMlsCrypto, random::OpenMlsRand, signatures::Signer};
 
 #[cfg(feature = "extensions-draft-08")]
 use crate::group::{PendingSafeExportSecretError, SafeExportSecretError};
@@ -132,23 +132,41 @@ impl MlsGroup {
     pub fn export_message_secrets_store(
         &self,
         group_key: &[u8],
+        key_version: u32,
         crypto: &impl OpenMlsCrypto,
+        rand: &impl OpenMlsRand,
     ) -> Result<Vec<u8>, ExportSecretsStoreError> {
         let aead_type = self.ciphersuite().aead_algorithm();
         let epoch = self.epoch().as_u64();
 
-        // Deterministic nonce: epoch as 8-byte LE, zero-padded to 12 bytes.
-        let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&epoch.to_le_bytes());
+        // Fresh CSPRNG nonce for every export. The same epoch may be exported
+        // by several devices under the same Group Key; deterministic nonces
+        // would turn that into a catastrophic AEAD nonce reuse.
+        let nonce = rand
+            .random_vec(self.ciphersuite().aead_nonce_length())
+            .map_err(|_| ExportSecretsStoreError::Crypto)?;
+        let aad = super::past_secrets::history_archive_aad(
+            self.group_id().as_slice(),
+            epoch,
+            key_version,
+        );
 
-        let plaintext =
-            postcard::to_allocvec(&self.message_secrets_store).map_err(ExportSecretsStoreError::Serialize)?;
+        // Snapshot the public leaves alongside the secrets. Stored-secret
+        // decryption needs the sender signature keys to authenticate the MLS
+        // framing before returning application plaintext.
+        let leaves: Vec<Member> = self.public_group().members().collect();
+        let plaintext = super::past_secrets::encode_history_archive(
+            &self.message_secrets_store,
+            &leaves,
+        )
+        .map_err(ExportSecretsStoreError::Serialize)?;
 
         let ciphertext = crypto
-            .aead_encrypt(aead_type, group_key, &plaintext, &nonce, &[])
+            .aead_encrypt(aead_type, group_key, &plaintext, &nonce, &aad)
             .map_err(|_| ExportSecretsStoreError::Crypto)?;
 
-        let mut out = Vec::with_capacity(12 + ciphertext.len());
+        let mut out = Vec::with_capacity(16 + nonce.len() + ciphertext.len());
+        out.extend_from_slice(super::past_secrets::HISTORY_ENVELOPE_MAGIC);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
         Ok(out)
