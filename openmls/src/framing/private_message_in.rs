@@ -7,6 +7,7 @@ use tls_codec::{
 use super::{
     codec::deserialize_ciphertext_content, mls_auth_content::FramedContentAuthData,
     mls_auth_content_in::VerifiableAuthenticatedContentIn, mls_content_in::FramedContentBodyIn,
+    private_message::key_enc_aad,
 };
 
 use crate::{
@@ -53,6 +54,21 @@ impl PrivateMessageIn {
     /// NOTE: This AAD is unverified.
     pub fn aad(&self) -> &[u8] {
         self.authenticated_data.as_slice()
+    }
+
+    /// AAD binding the wrapped content key to this exact message.
+    pub(crate) fn key_enc_aad(
+        &self,
+        sender: LeafNodeIndex,
+    ) -> Result<Vec<u8>, MessageDecryptionError> {
+        key_enc_aad(
+            &self.group_id,
+            self.epoch,
+            sender,
+            self.authenticated_data.as_slice(),
+            self.ciphertext.as_slice(),
+        )
+        .map_err(|_| MessageDecryptionError::MalformedContent)
     }
 
     /// Decrypt the sender data from this [`PrivateMessageIn`].
@@ -215,7 +231,7 @@ impl PrivateMessageIn {
     /// material, without touching the ratchet.
     pub(crate) fn to_verifiable_content_from_content_key(
         &self,
-        ciphersuite: Ciphersuite,
+        _ciphersuite: Ciphersuite,
         crypto: &impl OpenMlsCrypto,
         content_key: AeadKey,
         prepared_nonce: AeadNonce,

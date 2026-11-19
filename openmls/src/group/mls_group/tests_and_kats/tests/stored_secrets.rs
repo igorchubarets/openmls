@@ -106,6 +106,30 @@ fn with_key_enc(msg: &MlsMessageOut, key_enc: Vec<u8>) -> Vec<u8> {
         .unwrap()
 }
 
+fn with_aad(msg: &MlsMessageOut, aad: Vec<u8>) -> Vec<u8> {
+    let msg_in =
+        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
+    let private = match msg_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => p,
+        _ => panic!("expected a private message"),
+    };
+    let mut franken: FrankenPrivateMessage = PrivateMessage::from(private).into();
+    franken.authenticated_data = aad.into();
+    let restored: PrivateMessage = franken.into();
+    MlsMessageOut::from_private_message(restored, ProtocolVersion::Mls10)
+        .tls_serialize_detached()
+        .unwrap()
+}
+
+fn key_enc_of(msg: &MlsMessageOut) -> Vec<u8> {
+    let msg_in =
+        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
+    match msg_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => p.key_enc().to_vec(),
+        _ => panic!("expected a private message"),
+    }
+}
+
 /// The core fix: a member's OWN application message decrypts from their own
 /// epoch-secret blob via `key_enc` (previously `RatchetTypeError`), and
 /// repeated decryption is idempotent.
@@ -425,4 +449,61 @@ fn forged_sender_signature_rejected_in_live_and_stored_paths() {
     let _ = alice_credential;
 }
 
+/// `key_enc` is bound to the exact ciphertext and the sender-signed replay
+/// identity in authenticated_data. It cannot be transplanted across messages,
+/// and changing the replay identity invalidates decryption.
+#[openmls_test::openmls_test]
+fn key_enc_is_bound_to_ciphertext_and_replay_id() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (_alice_credential, _bob_credential, mut alice_group, _bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
+    let replay_a = b"yourn-replay-v1|\x01\x00\x00\x00\x00\x00\x00\x00\x01".to_vec();
+    let replay_b = b"yourn-replay-v1|\x01\x00\x00\x00\x00\x00\x00\x00\x02".to_vec();
+
+    alice_group.set_aad(replay_a.clone());
+    let msg_a = alice_group
+        .create_message(provider, &_alice_credential.signer, b"bound message")
+        .expect("create first message");
+    alice_group.set_aad(replay_b.clone());
+    let msg_b = alice_group
+        .create_message(provider, &_alice_credential.signer, b"bound message")
+        .expect("create second message");
+
+    let blob = alice_group
+        .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
+        .expect("export secrets");
+    let decrypt = |ciphertext: &[u8]| {
+        decrypt_application_message_with_stored_secrets(
+            &blob,
+            &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
+            ciphertext,
+            ciphersuite,
+            provider.crypto(),
+        )
+    };
+
+    let (plaintext, _credential, replay_id) = decrypt(
+        &msg_a.tls_serialize_detached().unwrap(),
+    )
+    .expect("first message decrypts");
+    assert_eq!(plaintext, b"bound message");
+    assert_eq!(replay_id, replay_a);
+
+    let transplanted = with_key_enc(&msg_a, key_enc_of(&msg_b));
+    assert!(
+        decrypt(&transplanted).is_err(),
+        "key_enc from another ciphertext must fail"
+    );
+
+    let tampered_aad = with_aad(&msg_a, replay_b);
+    assert!(
+        decrypt(&tampered_aad).is_err(),
+        "changing the signed replay identity must fail"
+    );
+}

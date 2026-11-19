@@ -737,9 +737,8 @@ pub fn decrypt_application_message_with_stored_secrets(
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
     use crate::framing::errors::MessageDecryptionError;
-    use crate::group::mls_group::past_secrets::MessageSecretsStore;
 
     // New envelopes bind the archive to room, epoch, and Group Key version
     // with a random nonce. Legacy blobs have no version prefix and no AAD; they
@@ -788,7 +787,7 @@ fn decrypt_application_message_from_store(
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
     use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
     use crate::error::LibraryError;
     use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
@@ -830,8 +829,16 @@ fn decrypt_application_message_from_store(
     let key_enc_nonce = message_secrets
         .key_enc_nonce(crypto, ciphersuite, sender_data.leaf_index, sender_data.generation)
         .map_err(LibraryError::unexpected_crypto_error)?;
+    let key_enc_aad = if ciphertext
+        .aad()
+        .starts_with(crate::framing::private_message::YOURN_REPLAY_AAD_MAGIC)
+    {
+        ciphertext.key_enc_aad(sender_data.leaf_index)?
+    } else {
+        Vec::new()
+    };
     let wrapped = AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
-        .aead_open(crypto, ciphertext.key_enc(), &[], &key_enc_nonce)
+        .aead_open(crypto, ciphertext.key_enc(), &key_enc_aad, &key_enc_nonce)
         .map_err(|_| MessageDecryptionError::AeadError)?;
     if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
         return Err(MessageDecryptionError::MalformedContent);
@@ -870,7 +877,11 @@ fn decrypt_application_message_from_store(
     let plaintext = authenticated
         .into_application_bytes()
         .ok_or(MessageDecryptionError::MalformedContent)?;
-    Ok((plaintext, member.credential.serialized_content().to_vec()))
+    Ok((
+        plaintext,
+        member.credential.serialized_content().to_vec(),
+        ciphertext.aad().to_vec(),
+    ))
 }
 
 impl MlsGroup {
@@ -886,7 +897,7 @@ impl MlsGroup {
         &self,
         ciphertext_tls: &[u8],
         crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-    ) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
         use crate::framing::errors::MessageDecryptionError;
         use crate::group::mls_group::past_secrets::MessageSecretsStore;
 

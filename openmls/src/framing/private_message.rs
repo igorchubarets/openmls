@@ -5,8 +5,8 @@ use tls_codec::{Serialize, Size, TlsSerialize, TlsSize};
 use super::mls_auth_content::AuthenticatedContent;
 
 use crate::{
-    binary_tree::array_representation::LeafNodeIndex, error::LibraryError,
-    tree::secret_tree::SecretType,
+    binary_tree::array_representation::LeafNodeIndex, ciphersuite::Secret,
+    error::LibraryError, tree::secret_tree::SecretType,
 };
 
 use super::*;
@@ -44,6 +44,40 @@ pub struct PrivateMessage {
     pub(crate) ciphertext: VLBytes,
     pub(crate) key_enc: VLBytes,
 }
+
+/// AAD binding the Yourn `key_enc` extension to the exact ciphertext and
+/// sender-signed replay identity carried in `authenticated_data`.
+#[derive(TlsSerialize, TlsSize)]
+struct YournKeyEncAad<'a> {
+    version: u8,
+    group_id: GroupId,
+    epoch: GroupEpoch,
+    sender: u32,
+    authenticated_data: tls_codec::VLByteSlice<'a>,
+    ciphertext: tls_codec::VLByteSlice<'a>,
+}
+
+pub(crate) fn key_enc_aad(
+    group_id: &GroupId,
+    epoch: GroupEpoch,
+    sender: LeafNodeIndex,
+    authenticated_data: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, LibraryError> {
+    YournKeyEncAad {
+        version: 1,
+        group_id: group_id.clone(),
+        epoch,
+        sender: sender.u32(),
+        authenticated_data: tls_codec::VLByteSlice(authenticated_data),
+        ciphertext: tls_codec::VLByteSlice(ciphertext),
+    }
+    .tls_serialize_detached()
+    .map_err(LibraryError::missing_bound_check)
+}
+
+/// Domain separator for Yourn's signed replay identity in authenticated_data.
+pub(crate) const YOURN_REPLAY_AAD_MAGIC: &[u8] = b"yourn-replay-v1|";
 
 pub(crate) struct MlsMessageHeader {
     pub(crate) group_id: GroupId,
@@ -179,44 +213,46 @@ impl PrivateMessage {
         let private_message_content_aad_bytes = private_message_content_aad
             .tls_serialize_detached()
             .map_err(LibraryError::missing_bound_check)?;
-        // Extract generation and key material for encryption
+        // Advance the sender's secret tree, but do not reuse the ratchet key
+        // as the content key for Yourn messages. Standard MLS messages (no
+        // authenticated replay identity) keep the ratchet-key behaviour so the
+        // upstream test/KAT surface remains valid. The provider's chat path
+        // always supplies a replay identity, which selects the HP3 path below.
+        let replay_bound = public_message
+            .authenticated_data()
+            .starts_with(YOURN_REPLAY_AAD_MAGIC);
         let secret_type = SecretType::from(&public_message.content().content_type());
         let (generation, (ratchet_key, ratchet_nonce)) = message_secrets
             .secret_tree_mut()
             // Even in tests we want to use the real sender index, so we have a key to encrypt.
             .secret_for_encryption(ciphersuite, crypto, sender_index, secret_type)?;
-        // Wrap the ratchet key material (key ‖ nonce) under the epoch wrap
-        // key, so the message can be decrypted from a stored epoch-secret blob
-        // at any time — own messages included — without live ratchet state.
-        // Only the sender does this; members unwrap the same bytes with the
-        // wrap key from their own blob. Empty for non-application messages.
-        let key_enc = if public_message.content().content_type().is_application_message() {
-            let key_enc_nonce = message_secrets
-                .key_enc_nonce(crypto, ciphersuite, sender_index, generation)
-                .map_err(LibraryError::unexpected_crypto_error)?;
-            AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
-                .aead_seal(
-                    crypto,
-                    &[ratchet_key.as_slice(), ratchet_nonce.as_slice()].concat(),
-                    &[],
-                    &key_enc_nonce,
-                )
-                .map_err(LibraryError::unexpected_crypto_error)?
+        let (content_key_bytes, content_nonce_bytes) = if replay_bound {
+            (
+                rand.random_vec(ciphersuite.aead_key_length())
+                    .map_err(|_| LibraryError::custom("content key generation failed"))?,
+                rand.random_vec(ciphersuite.aead_nonce_length())
+                    .map_err(|_| LibraryError::custom("content nonce generation failed"))?,
+            )
         } else {
-            Vec::new()
+            (
+                ratchet_key.as_slice().to_vec(),
+                ratchet_nonce.as_slice().to_vec(),
+            )
         };
+        let content_key = AeadKey::from_secret(Secret::from_slice(&content_key_bytes), ciphersuite);
+        let content_nonce = AeadNonce::from_secret(Secret::from_slice(&content_nonce_bytes));
         // Sample reuse guard uniformly at random.
         let reuse_guard: ReuseGuard =
             ReuseGuard::try_from_random(rand).map_err(LibraryError::unexpected_crypto_error)?;
         // Prepare the nonce by xoring with the reuse guard.
-        let prepared_nonce = ratchet_nonce.xor_with_reuse_guard(&reuse_guard);
+        let prepared_nonce = content_nonce.xor_with_reuse_guard(&reuse_guard);
         // Encrypt the payload
         log_crypto!(
             trace,
-            "Encryption key for private message: {ratchet_key:x?}"
+            "Encryption key for private message: {content_key:x?}"
         );
-        log_crypto!(trace, "Encryption of private message private_message_content_aad_bytes: {private_message_content_aad_bytes:x?} - ratchet_nonce: {prepared_nonce:x?}");
-        let ciphertext = ratchet_key
+        log_crypto!(trace, "Encryption of private message private_message_content_aad_bytes: {private_message_content_aad_bytes:x?} - content_nonce: {prepared_nonce:x?}");
+        let ciphertext = content_key
             .aead_seal(
                 crypto,
                 &Self::encode_padded_ciphertext_content_detached(
@@ -229,6 +265,35 @@ impl PrivateMessage {
                 &prepared_nonce,
             )
             .map_err(LibraryError::unexpected_crypto_error)?;
+        // Wrap the random content key material under the epoch wrap key. The
+        // AAD binds it to the group, epoch, sender, signed replay identity, and
+        // exact ciphertext, so the wrapped key cannot be transplanted.
+        let key_enc = if public_message.content().content_type().is_application_message() {
+            let key_enc_nonce = message_secrets
+                .key_enc_nonce(crypto, ciphersuite, sender_index, generation)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            let aad = if replay_bound {
+                key_enc_aad(
+                    &header.group_id,
+                    header.epoch,
+                    header.sender,
+                    public_message.authenticated_data(),
+                    &ciphertext,
+                )?
+            } else {
+                Vec::new()
+            };
+            AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
+                .aead_seal(
+                    crypto,
+                    &[content_key_bytes.as_slice(), content_nonce_bytes.as_slice()].concat(),
+                    &aad,
+                    &key_enc_nonce,
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?
+        } else {
+            Vec::new()
+        };
         log::trace!("Encrypted ciphertext {ciphertext:x?}");
         // Derive the sender data key from the key schedule using the ciphertext.
         let sender_data_key = message_secrets
