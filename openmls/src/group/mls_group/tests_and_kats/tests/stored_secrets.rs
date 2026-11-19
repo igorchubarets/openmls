@@ -136,7 +136,7 @@ fn own_message_decrypts_from_stored_secrets() {
         provider.crypto(),
     )
     .expect("Own message should decrypt from own stored secrets via key_enc.");
-    assert_eq!(plaintext, b"hello from alice");
+    assert_eq!(plaintext.0, b"hello from alice");
 
     // Idempotent: nothing is consumed, so re-decryption works again.
     let plaintext_again = decrypt_application_message_with_stored_secrets(
@@ -150,7 +150,7 @@ fn own_message_decrypts_from_stored_secrets() {
         provider.crypto(),
     )
     .expect("Re-decryption must be idempotent.");
-    assert_eq!(plaintext_again, b"hello from alice");
+    assert_eq!(plaintext_again.0, b"hello from alice");
 }
 
 /// The wrap key is epoch-deterministic across members, so every member's own
@@ -183,7 +183,7 @@ fn every_members_blob_decrypts_the_message() {
             provider.crypto(),
         )
         .expect("Every member's blob must decrypt the same message.");
-        assert_eq!(plaintext, b"shared secret");
+        assert_eq!(plaintext.0, b"shared secret");
     }
 }
 
@@ -299,7 +299,7 @@ fn archive_exports_use_fresh_nonce_and_aad_binding() {
         provider.crypto(),
     )
     .expect("correct AAD must decrypt");
-    assert_eq!(plaintext, b"aad-bound");
+    assert_eq!(plaintext.0, b"aad-bound");
 }
 
 /// Pre-launch hardening: unversioned archives and application messages without

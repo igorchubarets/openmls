@@ -737,7 +737,7 @@ pub fn decrypt_application_message_with_stored_secrets(
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
     use crate::framing::errors::MessageDecryptionError;
     use crate::group::mls_group::past_secrets::MessageSecretsStore;
 
@@ -788,7 +788,7 @@ fn decrypt_application_message_from_store(
     ciphertext_tls: &[u8],
     ciphersuite: openmls_traits::types::Ciphersuite,
     crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
     use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
     use crate::error::LibraryError;
     use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
@@ -867,9 +867,10 @@ fn decrypt_application_message_from_store(
     let authenticated = verifiable
         .verify(crypto, &signature_key)
         .map_err(|_| MessageDecryptionError::InvalidSignature)?;
-    authenticated
+    let plaintext = authenticated
         .into_application_bytes()
-        .ok_or(MessageDecryptionError::MalformedContent)
+        .ok_or(MessageDecryptionError::MalformedContent)?;
+    Ok((plaintext, member.credential.serialized_content().to_vec()))
 }
 
 impl MlsGroup {
@@ -885,7 +886,7 @@ impl MlsGroup {
         &self,
         ciphertext_tls: &[u8],
         crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
-    ) -> Result<Vec<u8>, crate::framing::errors::MessageDecryptionError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), crate::framing::errors::MessageDecryptionError> {
         use crate::framing::errors::MessageDecryptionError;
         use crate::group::mls_group::past_secrets::MessageSecretsStore;
 
