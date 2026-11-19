@@ -137,6 +137,13 @@ fn own_message_decrypts_from_stored_secrets() {
     )
     .expect("Own message should decrypt from own stored secrets via key_enc.");
     assert_eq!(plaintext.0, b"hello from alice");
+    assert_eq!(
+        plaintext.1,
+        alice_credential
+            .credential_with_key
+            .credential
+            .serialized_content()
+    );
 
     // Idempotent: nothing is consumed, so re-decryption works again.
     let plaintext_again = decrypt_application_message_with_stored_secrets(
@@ -151,6 +158,7 @@ fn own_message_decrypts_from_stored_secrets() {
     )
     .expect("Re-decryption must be idempotent.");
     assert_eq!(plaintext_again.0, b"hello from alice");
+    assert_eq!(plaintext_again.1, plaintext.1);
 }
 
 /// The wrap key is epoch-deterministic across members, so every member's own
