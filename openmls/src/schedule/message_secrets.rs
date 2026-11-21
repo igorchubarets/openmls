@@ -98,21 +98,30 @@ impl MessageSecrets {
         sender_leaf: LeafNodeIndex,
         generation: u32,
     ) -> Result<AeadNonce, CryptoError> {
-        // The wrap key can be shorter than the HKDF PRK length, so first
-        // extract a full-length PRK from it (HKDF-Extract accepts a salt of
-        // any length; only the PRK is fixed-length).
-        let context = [sender_leaf.u32().to_le_bytes(), generation.to_le_bytes()].concat();
-        let prk = Secret::from_slice(b"yourn_keyenc").hkdf_extract(crypto, ciphersuite, &self.wrap_key)?;
-        Ok(AeadNonce::from_secret(
-            prk.kdf_expand_label(
-                crypto,
-                ciphersuite,
-                "nonce",
-                &context,
-                ciphersuite.aead_nonce_length(),
-            )?,
-        ))
+        key_enc_nonce_from_wrap_key(crypto, ciphersuite, &self.wrap_key, sender_leaf, generation)
     }
+}
+
+/// Derive the per-message `key_enc` nonce from the epoch wrap key.
+pub(crate) fn key_enc_nonce_from_wrap_key(
+    crypto: &impl OpenMlsCrypto,
+    ciphersuite: Ciphersuite,
+    wrap_key: &Secret,
+    sender_leaf: LeafNodeIndex,
+    generation: u32,
+) -> Result<AeadNonce, CryptoError> {
+    // The wrap key can be shorter than the HKDF PRK length, so first
+    // extract a full-length PRK from it (HKDF-Extract accepts a salt of
+    // any length; only the PRK is fixed-length).
+    let context = [sender_leaf.u32().to_le_bytes(), generation.to_le_bytes()].concat();
+    let prk = Secret::from_slice(b"yourn_keyenc").hkdf_extract(crypto, ciphersuite, wrap_key)?;
+    Ok(AeadNonce::from_secret(prk.kdf_expand_label(
+        crypto,
+        ciphersuite,
+        "nonce",
+        &context,
+        ciphersuite.aead_nonce_length(),
+    )?))
 }
 
 // Test functions

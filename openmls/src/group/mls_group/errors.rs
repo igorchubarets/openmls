@@ -494,6 +494,9 @@ pub enum ExportSecretsStoreError {
     /// AEAD encryption failed.
     #[error("AEAD encryption failed")]
     Crypto,
+    /// The epoch archive could not be encoded or decoded.
+    #[error("Epoch archive error: {0}")]
+    Archive(String),
 }
 
 

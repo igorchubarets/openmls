@@ -14,7 +14,10 @@ use crate::{
         mls_auth_content::AuthenticatedContent, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
         PrivateMessage,
     },
-    group::decrypt_application_message_with_stored_secrets,
+    group::{
+        decrypt_application_message_with_epoch_archive,
+        decrypt_application_message_with_stored_secrets,
+    },
     prelude::{
         tests_and_kats::utils::{generate_credential_with_key, CredentialWithKeyAndSigner},
         *,
@@ -506,4 +509,60 @@ fn key_enc_is_bound_to_ciphertext_and_replay_id() {
         decrypt(&tampered_aad).is_err(),
         "changing the signed replay identity must fail"
     );
+}
+
+
+/// An immutable epoch archive is identical before and after traffic and
+/// decrypts every message from that epoch, including messages sent after the
+/// export.
+#[openmls_test::openmls_test]
+fn epoch_archive_is_stable_and_decrypts_all_messages() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (alice_credential, bob_credential, mut alice_group, bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let commit_id = [7u8; 32];
+    let archive_before = alice_group
+        .export_epoch_archive_plaintext(&commit_id)
+        .expect("Error exporting epoch archive.");
+    assert_eq!(
+        archive_before,
+        bob_group
+            .export_epoch_archive_plaintext(&commit_id)
+            .expect("Error exporting Bob's epoch archive.")
+    );
+
+    let mut messages = Vec::new();
+    for body in [b"first".as_slice(), b"second", b"third"] {
+        let message = alice_group
+            .create_message(provider, &alice_credential.signer, body)
+            .expect("Error creating message.");
+        messages.push((body.to_vec(), message.tls_serialize_detached().unwrap()));
+    }
+    let archive_after = alice_group
+        .export_epoch_archive_plaintext(&commit_id)
+        .expect("Error exporting epoch archive after traffic.");
+    assert_eq!(archive_before, archive_after);
+
+    for (body, message) in messages {
+        let plaintext = decrypt_application_message_with_epoch_archive(
+            &archive_before,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            &commit_id,
+            &message,
+            ciphersuite,
+            provider.crypto(),
+        )
+        .expect("Epoch archive must decrypt a later message.");
+        assert_eq!(plaintext.0, body);
+        assert_eq!(
+            plaintext.1,
+            alice_credential
+                .credential_with_key
+                .credential
+                .serialized_content()
+        );
+        let _ = &bob_credential;
+    }
 }

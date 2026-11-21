@@ -63,6 +63,7 @@ pub(crate) mod creation;
 pub(crate) mod errors;
 pub(crate) mod membership;
 pub(crate) mod past_secrets;
+pub(crate) mod epoch_archive;
 pub(crate) mod processing;
 pub(crate) mod proposal;
 pub(crate) mod proposal_store;

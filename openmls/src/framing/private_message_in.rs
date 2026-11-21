@@ -14,6 +14,7 @@ use crate::{
     binary_tree::array_representation::LeafNodeIndex,
     error::LibraryError,
     framing::mls_content_in::FramedContentIn,
+    schedule::SenderDataSecret,
     tree::{secret_tree::SecretType, sender_ratchet::SenderRatchetConfiguration},
 };
 
@@ -78,15 +79,23 @@ impl PrivateMessageIn {
         crypto: &impl OpenMlsCrypto,
         ciphersuite: Ciphersuite,
     ) -> Result<MlsSenderData, MessageDecryptionError> {
+        self.sender_data_with_secret(message_secrets.sender_data_secret(), crypto, ciphersuite)
+    }
+
+    /// Decrypt sender data from an archived sender-data secret.
+    pub(crate) fn sender_data_with_secret(
+        &self,
+        sender_data_secret: &SenderDataSecret,
+        crypto: &impl OpenMlsCrypto,
+        ciphersuite: Ciphersuite,
+    ) -> Result<MlsSenderData, MessageDecryptionError> {
         log::debug!("Decrypting PrivateMessage");
         // Derive key from the key schedule using the ciphertext.
-        let sender_data_key = message_secrets
-            .sender_data_secret()
+        let sender_data_key = sender_data_secret
             .derive_aead_key(crypto, ciphersuite, self.ciphertext.as_slice())
             .map_err(LibraryError::unexpected_crypto_error)?;
         // Derive initial nonce from the key schedule using the ciphertext.
-        let sender_data_nonce = message_secrets
-            .sender_data_secret()
+        let sender_data_nonce = sender_data_secret
             .derive_aead_nonce(ciphersuite, crypto, self.ciphertext.as_slice())
             .map_err(LibraryError::unexpected_crypto_error)?;
         // Serialize sender data AAD

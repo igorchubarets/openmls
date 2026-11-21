@@ -980,6 +980,18 @@ pub(crate) struct SenderDataSecret {
 }
 
 impl SenderDataSecret {
+    /// Reconstruct the sender-data secret carried in a durable epoch archive.
+    pub(crate) fn from_archive_bytes(bytes: &[u8]) -> Self {
+        Self {
+            secret: Secret::from_slice(bytes),
+        }
+    }
+
+    /// Raw bytes for the canonical epoch archive.
+    pub(crate) fn archive_bytes(&self) -> &[u8] {
+        self.secret.as_slice()
+    }
+
     /// Derive an `ExporterSecret` from an `EpochSecret`.
     fn new(
         crypto: &impl OpenMlsCrypto,
