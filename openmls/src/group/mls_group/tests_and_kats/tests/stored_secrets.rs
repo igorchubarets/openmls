@@ -146,6 +146,33 @@ fn setup_two_member_group<Provider: crate::storage::OpenMlsProvider>(
     (alice_credential, bob_credential, alice_group, bob_group)
 }
 
+/// The wire format is standard MLS: parsing consumes exactly the serialized
+/// bytes, and the only extension is the history blob in authenticated_data.
+#[openmls_test::openmls_test]
+fn private_message_wire_is_standard_and_carries_history_blob() {
+    let provider = &Provider::default();
+    let bob_provider = &Provider::default();
+    let (alice_credential, _bob_credential, mut alice_group, _bob_group) =
+        setup_two_member_group(ciphersuite, provider, bob_provider);
+    let expected_replay = replay_id(99);
+
+    let msg = alice_group
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"standard wire",
+            &expected_replay,
+        )
+        .expect("Error creating message.");
+    let bytes = msg.tls_serialize_detached().expect("serialize");
+    let parsed = MlsMessageIn::tls_deserialize_exact(&bytes).expect("standard exact parse");
+    assert_eq!(parsed.tls_serialize_detached().expect("reserialize"), bytes);
+
+    let history = decode_history_blob(&history_blob_of(&msg)).expect("history blob");
+    assert_eq!(history.replay_id, expected_replay);
+    assert!(!history.key_enc.is_empty());
+}
+
 /// The core fix: a member's OWN application message decrypts from their own
 /// epoch-secret blob via the history key envelope (previously
 /// `RatchetTypeError`), and repeated decryption is idempotent.
