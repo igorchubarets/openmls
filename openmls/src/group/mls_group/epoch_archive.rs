@@ -7,9 +7,9 @@
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::types::Ciphersuite;
 
+use crate::binary_tree::array_representation::LeafNodeIndex;
 use crate::ciphersuite::{
-    signable::Verifiable, AeadKey, AeadNonce, OpenMlsSignaturePublicKey, Secret,
-    SignaturePublicKey,
+    signable::Verifiable, AeadKey, AeadNonce, OpenMlsSignaturePublicKey, Secret, SignaturePublicKey,
 };
 use crate::credentials::{BasicCredential, Credential};
 use crate::error::LibraryError;
@@ -17,7 +17,6 @@ use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessag
 use crate::group::errors::ExportSecretsStoreError;
 use crate::schedule::message_secrets::key_enc_nonce_from_wrap_key;
 use crate::schedule::SenderDataSecret;
-use crate::binary_tree::array_representation::LeafNodeIndex;
 use tls_codec::Deserialize as _;
 
 use super::*;
@@ -103,17 +102,12 @@ pub fn decrypt_application_message_with_epoch_archive(
         return Err(MessageDecryptionError::MalformedContent);
     }
 
-    let sender_data = ciphertext.sender_data_with_secret(
-        &archive.sender_data_secret,
-        crypto,
-        ciphersuite,
-    )?;
+    let sender_data =
+        ciphertext.sender_data_with_secret(&archive.sender_data_secret, crypto, ciphersuite)?;
     if !ciphertext.content_type().is_application_message() {
         return Err(MessageDecryptionError::NotApplicationContent);
     }
-    if ciphertext.key_enc().is_empty() {
-        return Err(MessageDecryptionError::MalformedContent);
-    }
+    let history = crate::framing::history::decode_history_blob(ciphertext.aad())?;
     let key_enc_nonce = key_enc_nonce_from_wrap_key(
         crypto,
         ciphersuite,
@@ -122,16 +116,16 @@ pub fn decrypt_application_message_with_epoch_archive(
         sender_data.generation,
     )
     .map_err(LibraryError::unexpected_crypto_error)?;
-    let key_enc_aad = if ciphertext
-        .aad()
-        .starts_with(crate::framing::private_message::YOURN_REPLAY_AAD_MAGIC)
-    {
-        ciphertext.key_enc_aad(sender_data.leaf_index)?
-    } else {
-        Vec::new()
-    };
+    let key_enc_aad = crate::framing::history::key_enc_aad(
+        ciphertext.group_id(),
+        ciphertext.epoch(),
+        sender_data.leaf_index,
+        sender_data.generation,
+        &history.replay_id,
+    )
+    .map_err(|_| MessageDecryptionError::MalformedContent)?;
     let wrapped = AeadKey::from_secret(archive.wrap_key.clone(), ciphersuite)
-        .aead_open(crypto, ciphertext.key_enc(), &key_enc_aad, &key_enc_nonce)
+        .aead_open(crypto, &history.key_enc, &key_enc_aad, &key_enc_nonce)
         .map_err(|_| MessageDecryptionError::AeadError)?;
     if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
         return Err(MessageDecryptionError::MalformedContent);
@@ -171,7 +165,7 @@ pub fn decrypt_application_message_with_epoch_archive(
     Ok((
         plaintext,
         member.credential.serialized_content().to_vec(),
-        ciphertext.aad().to_vec(),
+        history.replay_id,
     ))
 }
 

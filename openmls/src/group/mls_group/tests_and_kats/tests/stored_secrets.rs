@@ -1,18 +1,15 @@
-//! Tests for stored-secrets decryption with the per-message `key_enc`
-//! extension.
+//! Tests for stored-secrets decryption with the versioned history blob.
 //!
 //! `decrypt_application_message_with_stored_secrets` decrypts an application
 //! message from an exported epoch-secret blob without any live group state.
-//! With the `key_enc` extension (the sender's wrapped content key material
-//! carried inside the message) this works for the sender's OWN messages too —
-//! previously a `RatchetTypeError`, since the stored secret tree holds an
-//! encryption ratchet for the own leaf — and is idempotent, since nothing is
-//! consumed.
+//! The signed history blob in MLS authenticated data carries the wrapped MLS
+//! content key, so this works for the sender's OWN messages too and is
+//! idempotent because nothing is consumed.
 
 use crate::{
     framing::{
-        mls_auth_content::AuthenticatedContent, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
-        PrivateMessage,
+        history::{decode_history_blob, encode_history_blob},
+        MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, PrivateMessage,
     },
     group::{
         decrypt_application_message_with_epoch_archive,
@@ -27,13 +24,70 @@ use crate::{
 };
 use tls_codec::{Deserialize, Serialize};
 
+fn replay_id(seq: u64) -> Vec<u8> {
+    format!("yourn-replay-v1|{seq}").into_bytes()
+}
+
+fn history_blob_of(msg: &MlsMessageOut) -> Vec<u8> {
+    let msg_in =
+        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
+    match msg_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => p.aad().to_vec(),
+        _ => panic!("expected a private message"),
+    }
+}
+
+fn key_enc_of(msg: &MlsMessageOut) -> Vec<u8> {
+    decode_history_blob(&history_blob_of(msg))
+        .expect("valid history blob")
+        .key_enc
+}
+
+fn with_aad(msg: &MlsMessageOut, aad: Vec<u8>) -> Vec<u8> {
+    let msg_in =
+        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
+    let private = match msg_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(p) => p,
+        _ => panic!("expected a private message"),
+    };
+    let mut franken: FrankenPrivateMessage = PrivateMessage::from(private).into();
+    franken.authenticated_data = aad.into();
+    let restored: PrivateMessage = franken.into();
+    MlsMessageOut::from_private_message(restored, ProtocolVersion::Mls10)
+        .tls_serialize_detached()
+        .unwrap()
+}
+
+fn with_history_key_enc(msg: &MlsMessageOut, key_enc: Vec<u8>) -> Vec<u8> {
+    let mut history = decode_history_blob(&history_blob_of(msg)).expect("valid history blob");
+    history.key_enc = key_enc;
+    with_aad(
+        msg,
+        encode_history_blob(&history.replay_id, &history.key_enc),
+    )
+}
+
+fn with_history_replay_id(msg: &MlsMessageOut, replay_id: Vec<u8>) -> Vec<u8> {
+    let mut history = decode_history_blob(&history_blob_of(msg)).expect("valid history blob");
+    history.replay_id = replay_id;
+    with_aad(
+        msg,
+        encode_history_blob(&history.replay_id, &history.key_enc),
+    )
+}
+
 /// Set up a two-member group (Alice owns it, Bob joins via the welcome).
 /// Each member uses their own provider, as storage is per-member.
 fn setup_two_member_group<Provider: crate::storage::OpenMlsProvider>(
     ciphersuite: Ciphersuite,
     alice_provider: &Provider,
     bob_provider: &Provider,
-) -> (CredentialWithKeyAndSigner, CredentialWithKeyAndSigner, MlsGroup, MlsGroup) {
+) -> (
+    CredentialWithKeyAndSigner,
+    CredentialWithKeyAndSigner,
+    MlsGroup,
+    MlsGroup,
+) {
     let alice_credential = generate_credential_with_key(
         b"Alice".to_vec(),
         ciphersuite.signature_algorithm(),
@@ -92,50 +146,9 @@ fn setup_two_member_group<Provider: crate::storage::OpenMlsProvider>(
     (alice_credential, bob_credential, alice_group, bob_group)
 }
 
-/// Re-serialize a message, replacing its `key_enc` bytes (e.g. empty for a
-/// legacy message, or garbage for a tamper test).
-fn with_key_enc(msg: &MlsMessageOut, key_enc: Vec<u8>) -> Vec<u8> {
-    let msg_in =
-        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
-    let private = match msg_in.extract() {
-        MlsMessageBodyIn::PrivateMessage(p) => p,
-        _ => panic!("expected a private message"),
-    };
-    let mut franken: FrankenPrivateMessage = PrivateMessage::from(private).into();
-    franken.key_enc = key_enc.into();
-    let restored: PrivateMessage = franken.into();
-    MlsMessageOut::from_private_message(restored, ProtocolVersion::Mls10)
-        .tls_serialize_detached()
-        .unwrap()
-}
-
-fn with_aad(msg: &MlsMessageOut, aad: Vec<u8>) -> Vec<u8> {
-    let msg_in =
-        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
-    let private = match msg_in.extract() {
-        MlsMessageBodyIn::PrivateMessage(p) => p,
-        _ => panic!("expected a private message"),
-    };
-    let mut franken: FrankenPrivateMessage = PrivateMessage::from(private).into();
-    franken.authenticated_data = aad.into();
-    let restored: PrivateMessage = franken.into();
-    MlsMessageOut::from_private_message(restored, ProtocolVersion::Mls10)
-        .tls_serialize_detached()
-        .unwrap()
-}
-
-fn key_enc_of(msg: &MlsMessageOut) -> Vec<u8> {
-    let msg_in =
-        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
-    match msg_in.extract() {
-        MlsMessageBodyIn::PrivateMessage(p) => p.key_enc().to_vec(),
-        _ => panic!("expected a private message"),
-    }
-}
-
 /// The core fix: a member's OWN application message decrypts from their own
-/// epoch-secret blob via `key_enc` (previously `RatchetTypeError`), and
-/// repeated decryption is idempotent.
+/// epoch-secret blob via the history key envelope (previously
+/// `RatchetTypeError`), and repeated decryption is idempotent.
 #[openmls_test::openmls_test]
 fn own_message_decrypts_from_stored_secrets() {
     let provider = &Provider::default();
@@ -145,7 +158,12 @@ fn own_message_decrypts_from_stored_secrets() {
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     let msg = alice_group
-        .create_message(provider, &alice_credential.signer, b"hello from alice")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"hello from alice",
+            &replay_id(1),
+        )
         .expect("Error creating message.");
     let msg_bytes = msg.tls_serialize_detached().unwrap();
     let blob = alice_group
@@ -199,7 +217,12 @@ fn every_members_blob_decrypts_the_message() {
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     let msg = alice_group
-        .create_message(provider, &alice_credential.signer, b"shared secret")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"shared secret",
+            &replay_id(2),
+        )
         .expect("Error creating message.");
     let msg_bytes = msg.tls_serialize_detached().unwrap();
 
@@ -233,27 +256,18 @@ fn tampered_key_enc_rejected() {
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     let msg = alice_group
-        .create_message(provider, &alice_credential.signer, b"secret")
+        .create_message_with_history(provider, &alice_credential.signer, b"secret", &replay_id(3))
         .expect("Error creating message.");
     let blob = alice_group
         .export_message_secrets_store(&group_key, 1, provider.crypto(), provider.rand())
         .expect("Error exporting message secrets.");
 
-    // The original key_enc is opaque; grab its length to craft a same-length
-    // tampered replacement.
-    let msg_in =
-        MlsMessageIn::tls_deserialize_exact(&msg.tls_serialize_detached().unwrap()).unwrap();
-    let private = match msg_in.extract() {
-        MlsMessageBodyIn::PrivateMessage(p) => p,
-        _ => panic!("expected a private message"),
-    };
-    let franken: FrankenPrivateMessage = PrivateMessage::from(private).into();
-    let key_enc_len = franken.key_enc.as_slice().len();
+    // The wrapped key is opaque; craft a same-length tampered replacement.
+    let key_enc_len = key_enc_of(&msg).len();
     assert!(key_enc_len > 0);
-
     let mut tampered = vec![0u8; key_enc_len];
     tampered[0] ^= 0xff;
-    let tampered_bytes = with_key_enc(&msg, tampered);
+    let tampered_bytes = with_history_key_enc(&msg, tampered);
     assert!(
         decrypt_application_message_with_stored_secrets(
             &blob,
@@ -281,7 +295,12 @@ fn archive_exports_use_fresh_nonce_and_aad_binding() {
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     let msg = alice_group
-        .create_message(provider, &alice_credential.signer, b"aad-bound")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"aad-bound",
+            &replay_id(4),
+        )
         .expect("Error creating message.");
     let msg_bytes = msg.tls_serialize_detached().expect("serialize");
     let blob_a = alice_group
@@ -338,9 +357,9 @@ fn archive_exports_use_fresh_nonce_and_aad_binding() {
 }
 
 /// Pre-launch hardening: unversioned archives and application messages without
-/// key_enc are rejected; there is no legacy ratchet fallback.
+/// a valid history blob are rejected; there is no legacy ratchet fallback.
 #[openmls_test::openmls_test]
-fn unversioned_archive_and_empty_key_enc_rejected() {
+fn unversioned_archive_and_missing_history_blob_rejected() {
     let provider = &Provider::default();
     let bob_provider = &Provider::default();
     let (alice_credential, _bob_credential, mut alice_group, _bob_group) =
@@ -348,7 +367,12 @@ fn unversioned_archive_and_empty_key_enc_rejected() {
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     let msg = alice_group
-        .create_message(provider, &alice_credential.signer, b"no legacy")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"no legacy",
+            &replay_id(5),
+        )
         .expect("Error creating message.");
     let msg_bytes = msg.tls_serialize_detached().expect("serialize");
     let blob = alice_group
@@ -372,7 +396,7 @@ fn unversioned_archive_and_empty_key_enc_rejected() {
         "unversioned archive must fail closed"
     );
 
-    let missing_key_enc = with_key_enc(&msg, Vec::new());
+    let missing_blob = with_aad(&msg, Vec::new());
     assert!(
         decrypt_application_message_with_stored_secrets(
             &blob,
@@ -380,12 +404,30 @@ fn unversioned_archive_and_empty_key_enc_rejected() {
             alice_group.group_id().as_slice(),
             alice_group.epoch().as_u64(),
             1,
-            &missing_key_enc,
+            &missing_blob,
             ciphersuite,
             provider.crypto(),
         )
         .is_err(),
-        "application message without key_enc must fail closed"
+        "application message without a history blob must fail closed"
+    );
+
+    let mut unknown_version = history_blob_of(&msg);
+    unknown_version[16] = 0xff;
+    let unknown_version = with_aad(&msg, unknown_version);
+    assert!(
+        decrypt_application_message_with_stored_secrets(
+            &blob,
+            &group_key,
+            alice_group.group_id().as_slice(),
+            alice_group.epoch().as_u64(),
+            1,
+            &unknown_version,
+            ciphersuite,
+            provider.crypto(),
+        )
+        .is_err(),
+        "unknown history blob version must fail closed"
     );
 }
 
@@ -397,30 +439,20 @@ fn unversioned_archive_and_empty_key_enc_rejected() {
 fn forged_sender_signature_rejected_in_live_and_stored_paths() {
     let provider = &Provider::default();
     let bob_provider = &Provider::default();
-    let (alice_credential, bob_credential, mut alice_group, _bob_group) =
+    let (_alice_credential, bob_credential, mut alice_group, _bob_group) =
         setup_two_member_group(ciphersuite, provider, bob_provider);
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
     // Claim Alice's leaf index, but sign with Bob's key.
-    let forged = AuthenticatedContent::new_application(
-        LeafNodeIndex::new(0),
-        &[],
-        b"forged as alice",
-        alice_group.export_group_context(),
-        &bob_credential.signer,
-    )
-    .expect("Could not build forged application content.");
-
-    let forged_private = PrivateMessage::encrypt_without_check::<<Provider as crate::storage::OpenMlsProvider>::StorageError>(
-        provider.crypto(),
-        provider.rand(),
-        &forged,
-        ciphersuite,
-        alice_group.message_secrets_test_mut(),
-        0,
-    )
-    .expect("Could not encrypt forged application content.");
-    let forged_bytes = MlsMessageOut::from_private_message(forged_private, ProtocolVersion::Mls10)
+    let forged = alice_group
+        .create_message_with_history(
+            provider,
+            &bob_credential.signer,
+            b"forged as alice",
+            &replay_id(6),
+        )
+        .expect("Could not build forged application content.");
+    let forged_bytes = forged
         .tls_serialize_detached()
         .expect("Could not serialize forged message.");
 
@@ -448,31 +480,37 @@ fn forged_sender_signature_rejected_in_live_and_stored_paths() {
             .is_err(),
         "Live-secrets path accepted a forged sender signature."
     );
-
-    let _ = alice_credential;
 }
 
-/// `key_enc` is bound to the exact ciphertext and the sender-signed replay
-/// identity in authenticated_data. It cannot be transplanted across messages,
-/// and changing the replay identity invalidates decryption.
+/// The history key envelope is inside the sender-signed authenticated data. It
+/// cannot be transplanted across messages, and changing the replay identity
+/// invalidates decryption.
 #[openmls_test::openmls_test]
-fn key_enc_is_bound_to_ciphertext_and_replay_id() {
+fn history_key_enc_binds_generation_and_replay_id() {
     let provider = &Provider::default();
     let bob_provider = &Provider::default();
-    let (_alice_credential, _bob_credential, mut alice_group, _bob_group) =
+    let (alice_credential, _bob_credential, mut alice_group, _bob_group) =
         setup_two_member_group(ciphersuite, provider, bob_provider);
     let group_key = vec![0u8; ciphersuite.aead_key_length()];
 
-    let replay_a = b"yourn-replay-v1|\x01\x00\x00\x00\x00\x00\x00\x00\x01".to_vec();
-    let replay_b = b"yourn-replay-v1|\x01\x00\x00\x00\x00\x00\x00\x00\x02".to_vec();
+    let replay_a = replay_id(7);
+    let replay_b = replay_id(8);
 
-    alice_group.set_aad(replay_a.clone());
     let msg_a = alice_group
-        .create_message(provider, &_alice_credential.signer, b"bound message")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"bound message",
+            &replay_a,
+        )
         .expect("create first message");
-    alice_group.set_aad(replay_b.clone());
     let msg_b = alice_group
-        .create_message(provider, &_alice_credential.signer, b"bound message")
+        .create_message_with_history(
+            provider,
+            &alice_credential.signer,
+            b"bound message",
+            &replay_b,
+        )
         .expect("create second message");
 
     let blob = alice_group
@@ -491,26 +529,23 @@ fn key_enc_is_bound_to_ciphertext_and_replay_id() {
         )
     };
 
-    let (plaintext, _credential, replay_id) = decrypt(
-        &msg_a.tls_serialize_detached().unwrap(),
-    )
-    .expect("first message decrypts");
+    let (plaintext, _credential, resolved_replay_id) =
+        decrypt(&msg_a.tls_serialize_detached().unwrap()).expect("first message decrypts");
     assert_eq!(plaintext, b"bound message");
-    assert_eq!(replay_id, replay_a);
+    assert_eq!(resolved_replay_id, replay_a);
 
-    let transplanted = with_key_enc(&msg_a, key_enc_of(&msg_b));
+    let transplanted = with_history_key_enc(&msg_a, key_enc_of(&msg_b));
     assert!(
         decrypt(&transplanted).is_err(),
-        "key_enc from another ciphertext must fail"
+        "key envelope from another ciphertext must fail"
     );
 
-    let tampered_aad = with_aad(&msg_a, replay_b);
+    let tampered_aad = with_history_replay_id(&msg_a, replay_b);
     assert!(
         decrypt(&tampered_aad).is_err(),
         "changing the signed replay identity must fail"
     );
 }
-
 
 /// An immutable epoch archive is identical before and after traffic and
 /// decrypts every message from that epoch, including messages sent after the
@@ -533,9 +568,17 @@ fn epoch_archive_is_stable_and_decrypts_all_messages() {
     );
 
     let mut messages = Vec::new();
-    for body in [b"first".as_slice(), b"second", b"third"] {
+    for (index, body) in [b"first".as_slice(), b"second", b"third"]
+        .into_iter()
+        .enumerate()
+    {
         let message = alice_group
-            .create_message(provider, &alice_credential.signer, body)
+            .create_message_with_history(
+                provider,
+                &alice_credential.signer,
+                body,
+                &replay_id(10 + index as u64),
+            )
             .expect("Error creating message.");
         messages.push((body.to_vec(), message.tls_serialize_detached().unwrap()));
     }

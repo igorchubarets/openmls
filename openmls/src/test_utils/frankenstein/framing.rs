@@ -238,7 +238,6 @@ pub struct FrankenPrivateMessage {
     pub authenticated_data: VLBytes,
     pub encrypted_sender_data: VLBytes,
     pub ciphertext: VLBytes,
-    pub key_enc: VLBytes,
 }
 
 #[derive(

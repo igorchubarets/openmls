@@ -7,7 +7,6 @@ use tls_codec::{
 use super::{
     codec::deserialize_ciphertext_content, mls_auth_content::FramedContentAuthData,
     mls_auth_content_in::VerifiableAuthenticatedContentIn, mls_content_in::FramedContentBodyIn,
-    private_message::key_enc_aad,
 };
 
 use crate::{
@@ -33,7 +32,6 @@ use super::*;
 ///     opaque authenticated_data<V>;
 ///     opaque encrypted_sender_data<V>;
 ///     opaque ciphertext<V>;
-///     opaque key_enc<V>; // Yourn extension: per-message wrapped content key
 /// } PrivateMessage;
 /// ```
 #[derive(
@@ -46,7 +44,6 @@ pub struct PrivateMessageIn {
     authenticated_data: VLBytes,
     encrypted_sender_data: VLBytes,
     ciphertext: VLBytes,
-    key_enc: VLBytes,
 }
 
 impl PrivateMessageIn {
@@ -55,21 +52,6 @@ impl PrivateMessageIn {
     /// NOTE: This AAD is unverified.
     pub fn aad(&self) -> &[u8] {
         self.authenticated_data.as_slice()
-    }
-
-    /// AAD binding the wrapped content key to this exact message.
-    pub(crate) fn key_enc_aad(
-        &self,
-        sender: LeafNodeIndex,
-    ) -> Result<Vec<u8>, MessageDecryptionError> {
-        key_enc_aad(
-            &self.group_id,
-            self.epoch,
-            sender,
-            self.authenticated_data.as_slice(),
-            self.ciphertext.as_slice(),
-        )
-        .map_err(|_| MessageDecryptionError::MalformedContent)
     }
 
     /// Decrypt the sender data from this [`PrivateMessageIn`].
@@ -272,11 +254,6 @@ impl PrivateMessageIn {
         Ok(verifiable)
     }
 
-    /// Get the `key_enc` bytes (the per-message wrapped content key material).
-    pub(crate) fn key_enc(&self) -> &[u8] {
-        self.key_enc.as_slice()
-    }
-
     /// Get the `group_id` in the `PrivateMessage`.
     pub(crate) fn group_id(&self) -> &GroupId {
         &self.group_id
@@ -343,7 +320,6 @@ impl From<PrivateMessageIn> for PrivateMessage {
             authenticated_data: value.authenticated_data,
             encrypted_sender_data: value.encrypted_sender_data,
             ciphertext: value.ciphertext,
-            key_enc: value.key_enc,
         }
     }
 }
@@ -358,7 +334,6 @@ impl From<PrivateMessage> for PrivateMessageIn {
             authenticated_data: value.authenticated_data,
             encrypted_sender_data: value.encrypted_sender_data,
             ciphertext: value.ciphertext,
-            key_enc: value.key_enc,
         }
     }
 }

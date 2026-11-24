@@ -60,10 +60,10 @@ pub(crate) mod builder;
 pub(crate) mod commit_builder;
 pub(crate) mod config;
 pub(crate) mod creation;
+pub(crate) mod epoch_archive;
 pub(crate) mod errors;
 pub(crate) mod membership;
 pub(crate) mod past_secrets;
-pub(crate) mod epoch_archive;
 pub(crate) mod processing;
 pub(crate) mod proposal;
 pub(crate) mod proposal_store;
@@ -657,6 +657,33 @@ impl MlsGroup {
             self.ciphersuite(),
             self.message_secrets_store.message_secrets_mut(),
             padding_size,
+        )?;
+
+        provider
+            .storage()
+            .write_message_secrets(self.group_id(), &self.message_secrets_store)
+            .map_err(MessageEncryptionError::StorageError)?;
+
+        Ok(msg)
+    }
+
+    /// Encrypt an `AuthenticatedContent` using MLS content key material that
+    /// was derived before signing. The secret tree must not be advanced again.
+    pub(crate) fn encrypt_with_content_key<Provider: OpenMlsProvider>(
+        &mut self,
+        public_message: AuthenticatedContent,
+        provider: &Provider,
+        prepared: crate::framing::private_message::PreparedContentKey,
+    ) -> Result<PrivateMessage, MessageEncryptionError<Provider::StorageError>> {
+        let padding_size = self.configuration().padding_size();
+        let msg = PrivateMessage::try_from_authenticated_content_with_content_key(
+            provider.crypto(),
+            provider.rand(),
+            &public_message,
+            self.ciphersuite(),
+            self.message_secrets_store.message_secrets_mut(),
+            padding_size,
+            prepared,
         )?;
 
         provider

@@ -791,7 +791,6 @@ fn decrypt_application_message_from_store(
     use crate::ciphersuite::{AeadKey, AeadNonce, Secret};
     use crate::error::LibraryError;
     use crate::framing::{errors::MessageDecryptionError, MlsMessageBodyIn, MlsMessageIn};
-    use crate::group::mls_group::past_secrets::MessageSecretsStore;
     use tls_codec::Deserialize as _;
 
     // Decode the MLS ciphertext first (we need the epoch for nonce reconstruction).
@@ -807,38 +806,40 @@ fn decrypt_application_message_from_store(
     // Return EpochNotInStore if neither matches — the caller must provide the
     // correct snapshot for the target epoch.
     let epoch = ciphertext.epoch();
-    let message_secrets =
-        if let Some(secrets) = secrets_store.secrets_for_epoch_mut(epoch) {
-            secrets
-        } else if epoch.as_u64() == secrets_store.current_epoch() {
-            secrets_store.message_secrets_mut()
-        } else {
-            return Err(MessageDecryptionError::EpochNotInStore);
-        };
+    let message_secrets = if let Some(secrets) = secrets_store.secrets_for_epoch_mut(epoch) {
+        secrets
+    } else if epoch.as_u64() == secrets_store.current_epoch() {
+        secrets_store.message_secrets_mut()
+    } else {
+        return Err(MessageDecryptionError::EpochNotInStore);
+    };
 
     // Decrypt sender data.
     let sender_data = ciphertext.sender_data(message_secrets, crypto, ciphersuite)?;
-    // Every application message carries per-message wrapped key material.
-    // Empty key_enc is not a legacy ratchet fallback; it is malformed.
     if !ciphertext.content_type().is_application_message() {
         return Err(MessageDecryptionError::NotApplicationContent);
     }
-    if ciphertext.key_enc().is_empty() {
-        return Err(MessageDecryptionError::MalformedContent);
-    }
+    // Every chat application message carries the versioned history blob in
+    // authenticated_data. Missing or malformed blobs fail closed.
+    let history = crate::framing::history::decode_history_blob(ciphertext.aad())?;
     let key_enc_nonce = message_secrets
-        .key_enc_nonce(crypto, ciphersuite, sender_data.leaf_index, sender_data.generation)
+        .key_enc_nonce(
+            crypto,
+            ciphersuite,
+            sender_data.leaf_index,
+            sender_data.generation,
+        )
         .map_err(LibraryError::unexpected_crypto_error)?;
-    let key_enc_aad = if ciphertext
-        .aad()
-        .starts_with(crate::framing::private_message::YOURN_REPLAY_AAD_MAGIC)
-    {
-        ciphertext.key_enc_aad(sender_data.leaf_index)?
-    } else {
-        Vec::new()
-    };
+    let key_enc_aad = crate::framing::history::key_enc_aad(
+        ciphertext.group_id(),
+        ciphertext.epoch(),
+        sender_data.leaf_index,
+        sender_data.generation,
+        &history.replay_id,
+    )
+    .map_err(|_| MessageDecryptionError::MalformedContent)?;
     let wrapped = AeadKey::from_secret(message_secrets.wrap_key().clone(), ciphersuite)
-        .aead_open(crypto, ciphertext.key_enc(), &key_enc_aad, &key_enc_nonce)
+        .aead_open(crypto, &history.key_enc, &key_enc_aad, &key_enc_nonce)
         .map_err(|_| MessageDecryptionError::AeadError)?;
     if wrapped.len() != ciphersuite.aead_key_length() + ciphersuite.aead_nonce_length() {
         return Err(MessageDecryptionError::MalformedContent);
@@ -880,7 +881,7 @@ fn decrypt_application_message_from_store(
     Ok((
         plaintext,
         member.credential.serialized_content().to_vec(),
-        ciphertext.aad().to_vec(),
+        history.replay_id,
     ))
 }
 
@@ -911,8 +912,8 @@ impl MlsGroup {
         // Clone is only derived under test-utils).
         let store_bytes = postcard::to_allocvec(&self.message_secrets_store)
             .map_err(|_| MessageDecryptionError::MalformedContent)?;
-        let mut store: MessageSecretsStore =
-            postcard::from_bytes(&store_bytes).map_err(|_| MessageDecryptionError::MalformedContent)?;
+        let mut store: MessageSecretsStore = postcard::from_bytes(&store_bytes)
+            .map_err(|_| MessageDecryptionError::MalformedContent)?;
         let current_leaves: Vec<Member> = self.public_group().members().collect();
 
         decrypt_application_message_from_store(

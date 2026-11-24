@@ -56,6 +56,7 @@ use crate::{
 
 pub(crate) mod codec;
 
+pub(crate) mod history;
 pub(crate) mod message_in;
 pub(crate) mod message_out;
 pub(crate) mod mls_auth_content;
